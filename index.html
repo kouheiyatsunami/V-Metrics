@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="V-Metrics">
+    <link rel="apple-touch-icon" href="V-Metrics.white.png"> <link rel="manifest" href="manifest.json">
+    <title>V-Metrics</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="home-screen">
+        <h1 class="app-title">
+            <img src="V-Metrics.png" id="home-icon" class="home-icon-image" />
+            <img src="logo.png" alt="V-Metrics" id="home-logo" class="home-logo-image" />
+        </h1>
+        <div class="menu-grid">
+            <div class="menu-card" id="menu-new-match">
+                <h2>試合記録</h2>
+                <p>新しい試合を開始する</p>
+            </div>
+            <div class="menu-card" id="menu-analysis">
+                <h2>データ分析</h2>
+                <p>試合結果を振り返る</p>
+            </div>
+            <div class="menu-card" id="menu-players">
+                <h2>選手管理</h2>
+                <p>名簿・背番号の登録</p>
+            </div>
+            <div class="menu-card" id="menu-settings">
+                <h2>設定</h2>
+                <p>データ管理・その他</p>
+            </div>
+        </div>
+    </div>
+    <div id="players-screen" style="display: none;">
+        <header class="screen-header">
+            <img src="logo.png" alt="V-Metrics" id="logo-ps" class="logo-image" />
+            <h1>選手管理</h1>
+            <button id="btn-add-player" class="action-btn submit">新規登録</button>
+        </header>
+        <div class="players-list-container">
+            <table id="players-table">
+                <thead>
+                    <tr>
+                        <th>背番号</th>
+                        <th>名前</th>
+                        <th>ポジション</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="players-table-body">
+                    </tbody>
+            </table>
+        </div>
+    </div>
+    <div id="player-edit-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h2>選手登録</h2>
+            <div class="modal-body">
+                <input type="hidden" id="edit-player-id"> <div class="select-group">
+                    <label>名&nbsp;前</label>
+                    <input type="text" id="input-player-name" placeholder="例: 山梨 太郎">
+                </div>
+                <div class="select-group">
+                    <label>背番号</label>
+                    <input type="number" id="input-player-jersey" placeholder="例: 1">
+                </div>
+                <div class="select-group">
+                    <label>ポジション (任意)</label>
+                    <select id="input-player-position">
+                        <option value="OH">レフト</option>
+                        <option value="MB">センター </option>
+                        <option value="OP">ライト</option>
+                        <option value="S">セッター</option>
+                        <option value="LB">リベロ</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-player-cancel" class="action-btn cancel">キャンセル</button>
+                <button id="btn-player-save" class="action-btn submit">保&nbsp;存</button>
+            </div>
+        </div>
+    </div>
+    <div id="settings-screen" style="display: none;">
+        <header class="screen-header">
+            <button id="btn-settings-back" class="action-btn small">← ホーム</button>
+            <h1>設定・データ管理</h1>
+        </header>
+        <div class="settings-content" style="padding: 20px; max-width: 800px; margin: 0 auto;">
+            <div class="setting-card">
+                <h3>データの書き出し (エクスポート)</h3>
+                <p>記録した全データをCSVファイルとしてダウンロードします。Excelで開くことができます。</p>
+                <button id="btn-export-csv" class="action-btn submit">
+                    📥 全データをCSVで出力
+                </button>
+            </div>
+            <div class="setting-card" style="margin-top: 20px;">
+                <h3>データの読み込み (インポート)</h3>
+                <p>CSVファイルを読み込んでデータを復元します。</p>
+                <button id="btn-import-csv" class="action-btn" disabled>
+                    📤 インポート (未実装)
+                </button>
+            </div>
+            <div class="setting-card" style="margin-top: 20px; border-color: var(--red);">
+                <h3 style="color: var(--red);">データ削除</h3>
+                <p>すべての試合データと選手データを削除します。この操作は取り消せません。</p>
+                <button id="btn-delete-all" class="action-btn undo">
+                    🗑️ 全データを削除
+                </button>
+            </div>
+
+        </div>
+    </div>
+    <div id="analysis-screen" style="display: none;">
+        <header class="screen-header">
+            <img src="logo.png" alt="V-Metrics" id="logo-as" class="logo-image" />
+            <h1>データ分析</h1>
+            <div class="header-controls">
+                <select id="analysis-category-select" class="filter-select">
+                    </select>
+                <select id="analysis-opponent-select" class="filter-select">
+                    <option value="all">対戦校 (全員)</option>
+                    </select>
+                <button id="btn-calc-stats" class="action-btn submit">集計</button>
+                <button id="btn-share-report" class="action-btn" style="background-color:#f39c12; color:black;">共有</button>
+            </div>
+        </header>
+        <div class="analysis-main">
+            <div class="analysis-tabs">
+                <button class="tab-btn selected" data-view="overall">全体統計</button>
+                <button class="tab-btn" data-view="spiker">スパイカー</button>
+                <button class="tab-btn" data-view="setter">トス</button>
+                <button class="tab-btn" data-view="pass">パス</button>
+            </div>
+            <div id="overall-analysis" class="analysis-content active">
+                <div class="overall-container">
+                    <div class="sub-tabs-vertical">
+                        <div class="sub-tab-btn selected" data-filter="total">全セット</div>
+                        <div class="sub-tab-btn" data-filter="win">勝セット</div>
+                        <div class="sub-tab-btn" data-filter="lose">負セット</div>
+                    </div>
+                    <div class="overall-content">
+                        <div id="overall-stats-grid" class="stats-grid">
+                            <div class="stats-row">
+                                <div class="stats-item"><span class="label">打数</span><span id="stat_TS" class="value">0</span></div>
+                                <div class="stats-item"><span class="label">決定数</span><span id="stat_TK" class="value">0</span></div>
+                            </div>
+                            <div class="stats-row">
+                                <div class="stats-item"><span class="label">決定率</span><span id="stat_PK" class="value">--.-%</span></div>
+                                <div class="stats-item"><span class="label">効果率</span><span id="stat_PE" class="value">--.-%</span></div>
+                                <div class="stats-item"><span class="label">失点率</span><span id="stat_PF" class="value">--.-%</span></div>
+                                <div class="stats-item"><span class="label">A&C決定率</span><span id="stat_PCA" class="value">--.-%</span></div>
+                            </div>
+                            <div class="stats-row">
+                                <div class="stats-item"><span class="label">セット平均打数</span><span id="stat_AS" class="value">0.0</span></div>
+                                <div class="stats-item"><span class="label">セット平均決定数</span><span id="stat_AK" class="value">0.0</span></div>
+                                <div class="stats-item"><span class="label">セット平均Aカット数</span><span id="stat_AA" class="value">0.0</span></div>
+                                <div class="stats-item"><span class="label">セット平均チャンス数</span><span id="stat_AC" class="value">0.0</span></div>
+                            </div>
+                        </div>
+                        <div id="overall-graphs" class="chart-section">
+                            <div class="chart-row">
+                                <div class="label-col"><span class="main-label">決定率</span></div>
+                                <div class="chart-col">
+                                    <div class="chart-bar total"><div id="bar_PK_total" class="bar-fill blue"></div></div>
+                                    <div class="chart-bar win"><div id="bar_PK_win" class="bar-fill red"></div></div>
+                                    <div class="chart-bar lose"><div id="bar_PK_lose" class="bar-fill light-blue"></div></div>
+                                </div>
+                            </div>
+                            <div class="chart-row">
+                                <div class="label-col"><span class="main-label">効果率</span></div>
+                                <div class="chart-col">
+                                    <div class="chart-bar total"><div id="bar_PE_total" class="bar-fill blue"></div></div>
+                                    <div class="chart-bar win"><div id="bar_PE_win" class="bar-fill red"></div></div>
+                                    <div class="chart-bar lose"><div id="bar_PE_lose" class="bar-fill light-blue"></div></div>
+                                </div>
+                            </div>
+                            <div class="chart-row">
+                                <div class="label-col"><span class="main-label">A&C決定率</span></div>
+                                <div class="chart-col">
+                                    <div class="chart-bar total"><div id="bar_PCA_total" class="bar-fill blue"></div></div>
+                                    <div class="chart-bar win"><div id="bar_PCA_win" class="bar-fill red"></div></div>
+                                    <div class="chart-bar lose"><div id="bar_PCA_lose" class="bar-fill light-blue"></div></div>
+                                </div>
+                            </div>
+                            <div class="chart-row">
+                                <div class="label-col"><span class="main-label">失点率</span></div>
+                                <div class="chart-col">
+                                    <div class="chart-bar total"><div id="bar_PF_total" class="bar-fill blue"></div></div>
+                                    <div class="chart-bar win"><div id="bar_PF_win" class="bar-fill red"></div></div>
+                                    <div class="chart-bar lose"><div id="bar_PF_lose" class="bar-fill light-blue"></div></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="spiker-analysis" class="analysis-content">
+                <div class="filter-controls">
+                    <div class="filter-group">
+                        <span>選手:</span>
+                        <select id="playerFilter" class="filter-select"></select>
+                    </div>
+                    <div class="filter-group">
+                        <span>セット:</span>
+                        <select id="setFilter" class="filter-select">
+                            <option value="total">全セット</option>
+                            <option value="win">勝セット</option>
+                            <option value="lose">負セット</option>
+                        </select>
+                    </div>
+                    <div class="tab-controls">
+                        <button id="spikerTab1" class="tab-btn selected">成績</button>
+                        <button id="spikerTab2" class="tab-btn">トス別</button>
+                    </div>
+                </div>
+                <div id="spiker-table-view" class="analysis-table">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>選手</th><th>Set平均</th><th>決定率</th><th>効果率</th><th>有効率</th><th>失点率</th>
+                                <th>Chance</th><th>A</th><th>A&C</th><th>DC</th><th>B</th><th>2段</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div id="spiker-table-view-2" class="analysis-table hidden">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>選手</th><th>決定率</th><th>効果率</th><th>有効率</th><th>失点率</th>
+                                <th>Good</th><th>割</th><th>近</th><th>長</th><th>短</th><th>高</th><th>低</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div id="spiker-graph-view" class="hidden">
+                    <div class="stats-grid">
+                         <div class="stats-row">
+                             <div class="stats-item"><span class="label">打数</span><span id="stat_TS_spiker" class="value">0</span></div>
+                             <div class="stats-item"><span class="label">得点</span><span id="stat_TK_spiker" class="value">0</span></div>
+                             <div class="stats-item"><span class="label">決定率</span><span id="stat_PK_spiker" class="value">--.-%</span></div>
+                         </div>
+                         <div id="spiker-graphs">
+                             </div>
+                         <div style="display:none;">
+                             <span id="stat_TF_spiker"></span><span id="stat_PE_spiker"></span><span id="stat_PKE_spiker"></span>
+                             <span id="stat_PF_spiker"></span><span id="stat_PC_spiker"></span><span id="stat_PA_spiker"></span>
+                             <span id="stat_PCA_spiker"></span><span id="stat_PKH_spiker"></span><span id="stat_PB_spiker"></span><span id="stat_P2_spiker"></span>
+                         </div>
+                    </div>
+                </div>
+                <div id="spiker-toss-graph-view" class="hidden">
+                    </div>
+            </div>
+            <div id="setter-analysis" class="analysis-content">
+                <div class="filter-controls">
+                    <div class="filter-group">
+                        <span>セッター:</span>
+                        <select id="setterPlayerFilter" class="filter-select"></select>
+                    </div>
+                    <div class="filter-group">
+                         <span>セット:</span>
+                        <select id="setterSetFilter" class="filter-select">
+                            <option value="total">Total</option>
+                            <option value="win">Win</option>
+                            <option value="lose">Lose</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <span>カット:</span>
+                        <select id="setterCutFilter" class="filter-select">
+                            <option value="all">全カット</option>
+                            <option value="A">Aカット</option>
+                            <option value="B">Bカット</option>
+                            <option value="CHANCE">Chance</option>
+                            <option value="AC">A & C</option>
+                            <option value="S2">S 2段</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="setter-layout-grid">
+                    <div id="setter-table-view" class="setter-grid-table">
+                        <table>
+                            </table>
+                    </div>
+                    <div id="setter-top5-combinations" class="setter-grid-top5">
+                        <h3>Top 5</h3>
+                        <ul id="setterTop5List"></ul>
+                    </div>
+                    <div class="setter-grid-pie1">
+                        <h3>トス質（Good/Other/Miss）</h3>
+                        <div class="pie-chart-layout">
+                            <div id="setterPieChart1" class="pie-chart-visual"></div>
+                            <div id="setterPieLegend1" class="pie-legend"></div>
+                        </div>
+                    </div>
+                     <div class="setter-grid-pie2">
+                        <h3>トス傾向 (詳細)</h3>
+                        <div class="pie-chart-layout">
+                            <div id="setterPieChart2" class="pie-chart-visual"></div>
+                            <div id="setterPieLegend2" class="pie-legend"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="pass-analysis" class="analysis-content"> <h3>サーブレシーブ返球率 (チーム)</h3>
+                <div id="pass-summary" class="summary-box" style="display:block; background:white;"></div>
+            </div>
+        </div>
+    </div>
+    <div id="timeout-screen" style="display: none;">
+        <header class="to-header">
+            <div class="to-title">速報レポート (Set <span id="to-set-num">1</span>)</div>
+            <div class="to-score">
+                <span class="our-score" id="to-our-score">20</span>
+                <span class="divider">-</span>
+                <span class="opp-score" id="to-opp-score">18</span>
+            </div>
+            <button id="btn-to-close" class="action-btn small">閉じる</button>
+        </header>
+        <div class="to-dashboard">
+            <div class="to-card attack-card">
+                <h3>アタック決定率</h3>
+                <div class="big-stat">
+                    <span id="to-kill-rate">--.-%</span>
+                    <span class="sub-stat">効果率: <span id="to-eff-rate">--.-%</span></span>
+                </div>
+                <div class="progress-bar-container">
+                    <div id="to-bar-kill" class="progress-fill blue" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="to-card sideout-card">
+                <h3>サイドアウト率</h3>
+                <div class="big-stat">
+                    <span id="to-sideout-rate">--.-%</span>
+                    <span class="sub-stat" id="to-sideout-count">0/0</span>
+                </div>
+                <div class="progress-bar-container">
+                    <div id="to-bar-sideout" class="progress-fill green" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="to-card pass-card">
+                <h3>サーブレシーブ (A/B率)</h3>
+                <div class="big-stat">
+                    <span id="to-pass-good">--.-%</span>
+                    <span class="sub-stat">失点: <span id="to-pass-error">0</span></span>
+                </div>
+                <div class="progress-bar-stacked">
+                    <div id="to-bar-pass-chance" class="stack-fill navy" style="width: 0%"></div>
+                    <div id="to-bar-pass-a" class="stack-fill green" style="width: 0%"></div>
+                    <div id="to-bar-pass-b" class="stack-fill orange" style="width: 0%"></div>
+                    <div id="to-bar-pass-c" class="stack-fill grey" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="to-card player-card">
+                <h3>得点リーダー (本数-決定率)</h3>
+                <ul id="to-top-scorers" class="to-list">
+                    </ul>
+            </div>
+            <div class="to-card error-card">
+                <h3>自チーム失点内訳</h3>
+                <div class="error-grid">
+                    <div>スパイク: <span id="to-err-spike">0</span></div>
+                    <div>サーブ: <span id="to-err-serve">0</span></div>
+                    <div>レシーブ: <span id="to-err-rece">0</span></div>
+                    <div>その他: <span id="to-err-other">0</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="record-screen" style="display: none;">
+        <div id="left-pane">
+            <header id="app-header">
+                <img src="logo.png" alt="V-Metrics" id="logo-rs" class="logo-image" />
+                <div id="game-controls">
+                    <button id="btn-timeout">タイムアウト</button>
+                    <button id="btn-set-end">セット終了</button>
+                </div>
+            </header>
+
+            <div id="court-toss-area">
+                <div id="mini-court">
+                    <div id="attack-line"></div>
+                    <div id="center-line"></div>
+                </div>
+                <button id="btn-chance" class="special-pass-btn">Chance</button>
+                <div id="toss-area-buttons">
+                <button class="toss-btn" id="btn-toss-L"><span>L</span></button>
+                <button class="toss-btn" id="btn-toss-B"><span>B</span></button>
+                <button class="toss-btn" id="btn-toss-A"><span>A</span></button>
+                <button class="toss-btn" id="btn-toss-C"><span>C</span></button>
+                <button class="toss-btn" id="btn-toss-R"><span>R</span></button>
+                <button class="toss-btn" id="btn-toss-BACK">BACK</button>
+            </div>
+            </div>
+
+            <div id="spiker-grid">
+                <div class="player-button" id="grid-pos-1" data-position="1"></div>
+                <div class="player-button" id="grid-pos-2" data-position="2"></div>
+                <div class="player-button" id="grid-pos-3" data-position="3"></div>
+                <div class="player-button" id="grid-pos-4" data-position="4"></div>
+                <div class="player-button" id="grid-pos-5" data-position="5"></div>
+                <div class="player-button" id="grid-pos-6" data-position="6"></div>
+            </div>
+
+        </div>
+
+        <div id="right-pane">
+            <div id="scoreboard">
+                <div class="team" id="our-team">
+                    <img src="volleyball.png" alt="●" id="our-serve-icon" class="server-indicator" />
+                    <span class="team-name">山梨大学</span>
+                    <span class="set-score" id="our-set-display">[ 0 ]</span>
+                    <span class="point-score" id="our-score-display">0</span>
+                </div>
+                <span class="point-score">-</span>
+                <div class="team" id="opponent-team">
+                    <span class="point-score" id="opp-score-display">0</span>
+                    <span class="set-score" id="opp-set-display">[ 0 ]</span>
+                    <span class="team-name" id="opp-team-name">相手チーム</span>
+                    <img src="volleyball.png" alt="●" id="opponent-serve-icon" class="server-indicator" />
+                </div>
+            </div>
+            <div id="action-grid"> 
+                <div id="score-correction-row">
+                    <button class="action-btn small" id="btn-self-plus">自＋１</button>
+                    <button class="action-btn small" id="btn-self-minus">自－１</button>
+                    <button class="action-btn small" id="btn-server-toggle">⇆</button>
+                    <button class="action-btn small" id="btn-opp-plus">相＋１</button>
+                    <button class="action-btn small" id="btn-opp-minus">相－１</button>
+                </div>
+                <button class="action-btn" id="btn-substitute">選手交代</button>
+                <button class="action-btn" id="btn-libero">リベロ IN</button>
+                <button class="action-btn undo" id="btn-undo">↩&emsp;取&nbsp;消</button>
+                <button class="action-btn" id="btn-open-log">履歴・修正</button>
+                <div id="current-inputs" class="span-2">
+                    <div class="input-row three-buttons">
+                        <button class="action-btn small" id="btn-input-miss">MISS</button>
+                        <button class="action-btn small" id="btn-input-direct">直</button>
+                        <button class="action-btn small" id="btn-input-two">ツー</button>
+                    </div>
+                    <div class="input-row three-buttons">
+                        <button class="action-btn small" id="btn-toss-far">割</button>
+                        <button class="action-btn small" id="btn-toss-long">長</button>
+                        <button class="action-btn small" id="btn-toss-high">高</button>
+                    </div>
+                    <div class="input-row three-buttons">
+                        <button class="action-btn small" id="btn-toss-near">近</button>
+                        <button class="action-btn small" id="btn-toss-short">短</button>
+                        <button class="action-btn small" id="btn-toss-low">低</button>
+                    </div>
+                    <div class="input-row">
+                        <select id="select-setter">
+                            <option value="">トス主</option>
+                            </select>
+                        <select id="select-pass-pos">
+                            <option value="">トス位置</option>
+                            <option value="A">A</option>
+                            <option value="B">B</option>
+                            <option value="CHANCE">Chance</option>
+                            <option value="S2">S2</option>
+                            <option value="L2">L2</option>
+                            <option value="O">O</option>
+                            <option value="UNKNOWN">不明</option>
+                        </select>
+                    </div>
+                    <div class="input-row">
+                        <select id="select-toss-area">
+                            <option value="">トスエリア</option>
+                            <option value="L">L</option>
+                            <option value="B">B</option>
+                            <option value="A">A</option>
+                            <option value="C">C</option>
+                            <option value="R">R</option>
+                            <option value="BACK">BACK</option>
+                            <option value="UNKNOWN">不明</option>
+                        </select>
+                        <select id="select-spiker">
+                            <option value="">スパイカー</option>
+                            <option value="NONE">なし</option>
+                            </select>
+                    </div>
+                    <div class="input-row">
+                        <select id="select-attack-type">
+                            <option value="">攻撃種別</option>
+                            <optgroup label="スパイク">
+                                <option value="LEFT">レフト</option>
+                                <option value="RIGHT">ライト</option>
+                                <option value="A_QUICK">Aクイック</option>
+                                <option value="B_QUICK">Bクイック</option>
+                                <option value="C_QUICK">Cクイック</option>
+                                <option value="A_SEMI">Aセミ</option>
+                                <option value="B_SEMI">Bセミ</option>
+                                <option value="C_SEMI">Cセミ</option>
+                                <option value="BACK_ATTACK">バックアタック</option>
+                            </optgroup>
+                            <optgroup label="特殊・ミス">
+                                <option value="DIRECT">ダイレクト</option>
+                                <option value="TWO_ATTACK">ツーアタック</option>
+                                <option value="FOUL">反則・ミス</option>
+                            </optgroup>
+                        </select>
+                        <select id="select-result">
+                            <option value="">結果</option>
+                            <option value="KILL">決定</option>
+                            <option value="EFFECTIVE">有効</option>
+                            <option value="CONTINUE">継続</option>
+                            <option value="FAULT">失点</option>
+                        </select>
+                    </div>
+                </div> 
+                <button class="action-btn cancel" id="btn-cancel">ク&nbsp;リ&nbsp;ア</button>
+                <button class="action-btn submit" id="btn-add">追&nbsp;加</button>
+            </div>
+        </div>
+    </div>
+    <div id="match-setup-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content large"> <h2>試合設定</h2>
+            <div class="modal-body row-layout">
+                <div class="setup-left">
+                    <div class="select-group">
+                        <label>大会名</label>
+                        <input type="text" id="setup-competition" placeholder="例: 東医体">
+                    </div>
+                    <div class="select-group">
+                        <label>対戦相手</label>
+                        <input type="text" id="setup-opponent" placeholder="例: A大学">
+                    </div>
+                    <div class="select-group">
+                        <label>試合種別</label>
+                        <select id="setup-match-type">
+                            <option value="official">公式戦</option>
+                            <option value="practice">練習試合</option>
+                            <option value="reference">参考試合</option>
+                        </select>
+                    </div>
+                    <hr>
+                    <div class="select-group">
+                        <label>リベロ1 (主)</label>
+                        <select id="setup-libero-1">
+                            <option value="">なし</option>
+                            </select>
+                    </div>
+                    <div class="select-group">
+                        <label>リベロ2 (副)</label>
+                        <select id="setup-libero-2">
+                            <option value="">なし</option>
+                        </select>
+                    </div>
+                    <hr>
+                    <div class="select-group">
+                        <label>第1セット サーブ権</label>
+                        <div class="radio-group">
+                            <label><input type="radio" name="first-serve" value="our" checked> 自チーム</label>
+                            <label><input type="radio" name="first-serve" value="opp"> 相手チーム</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setup-right">
+                    <h3>スタメン配置</h3>
+                    <div class="pattern-controls" style="display:flex; gap:10px; margin-bottom:10px; width:100%; justify-content:center;">
+                        <select id="select-pattern" style="max-width:150px;">
+                            <option value="">パターンを選択...</option>
+                            </select>
+                        <button id="btn-load-pattern" class="action-btn small">読&nbsp;込</button>
+                        <button id="btn-save-pattern" class="action-btn small">現在の配置を保存</button>
+                    </div>
+                    <div id="setup-court-container">
+                        <div class="setup-court"></div>
+                        <button class="starter-btn" id="btn-starter-4" data-pos="4">4 (前左)</button>
+                        <button class="starter-btn" id="btn-starter-3" data-pos="3">3 (前中)</button>
+                        <button class="starter-btn" id="btn-starter-2" data-pos="2">2 (前右)</button>
+                        <button class="starter-btn" id="btn-starter-5" data-pos="5">5 (後左)</button>
+                        <button class="starter-btn" id="btn-starter-6" data-pos="6">6 (後中)</button>
+                        <button class="starter-btn" id="btn-starter-1" data-pos="1">1 (サーブ)</button>
+                        <button id="btn-rotate-left" class="rotate-btn" title="反時計回り">↺</button>
+                        <button id="btn-rotate-right" class="rotate-btn" title="時計回り (ローテ)">↻</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-setup-cancel" class="action-btn cancel">キャンセル</button>
+                <button id="btn-match-start" class="action-btn submit">試合開始</button>
+                <button id="btn-next-set-start" class="action-btn submit" style="display: none;">次セット開始</button>
+            </div>
+        </div>
+    </div>
+    <div id="player-select-modal" class="modal-overlay" style="display: none; z-index: 1100;">
+        <div class="modal-content small">
+            <h3 id="player-modal-title">選手を選択</h3>
+            <div class="select-group">
+                <select id="select-starter-player">
+                    </select>
+            </div>
+            <div class="select-group">
+                <label>ポジション</label>
+                <select id="select-starter-role">
+                    <option value="S">セッター</option>
+                    <option value="OH">レフト</option>
+                    <option value="MB">センター</option>
+                    <option value="OP">ライト</option>
+                </select>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-ps-cancel" class="action-btn">戻&nbsp;る</button>
+                <button id="btn-ps-ok" class="action-btn submit">決&nbsp;定</button>
+            </div>
+        </div>
+    </div>
+    <div id="substitute-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h2 id="substitute-modal-title">選手交代</h2>
+            <div class="modal-body">
+                <div class="select-group">
+                    <label for="select-player-out">OUT (コート内)</label>
+                    <select id="select-player-out">
+                        </select>
+                </div>
+                <div class="select-group">
+                    <label for="select-player-in">IN (ベンチ)</label>
+                    <select id="select-player-in">
+                        </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-sub-cancel" class="action-btn cancel">キャンセル</button>
+                <button id="btn-sub-execute" class="action-btn submit">選手交代</button>
+            </div>
+        </div>
+    </div>
+    <div id="libero-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h2 id="libero-modal-title">リベロ交代</h2>
+            <div id="libero-modal-body" class="modal-body">
+                </div>
+            <div class="modal-footer">
+                <button id="btn-libero-cancel" class="action-btn cancel">キャンセル</button>
+                <button id="btn-libero-execute" class="action-btn submit">実&nbsp;行</button>
+            </div>
+        </div>
+    </div>
+    <div id="log-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content full-height">
+            <div class="modal-header">
+                <h2>プレイ履歴</h2>
+                <button id="btn-log-close" class="action-btn secondary">閉じる</button>
+            </div>
+            <div id="log-list-container" class="log-list">
+                </div>
+        </div>
+    </div>
+    <div id="set-end-modal" class="modal-overlay" style="display: none; z-index: 1200;">
+        <div class="modal-content small">
+            <h3>第 <span id="modal-set-num">1</span> セット 終了</h3>
+            <p style="text-align:center; font-size:1.2em; font-weight:bold;">
+                <span id="modal-set-score">25 - 23</span>
+            </p>
+            <p style="text-align:center;">このセットのデータを保存しました。</p>
+            <div class="modal-footer" style="flex-direction: column; gap: 10px;">
+                <button id="btn-goto-analysis" class="action-btn" style="background-color: var(--orange); color: black;">
+                    速報分析を見る
+                </button>
+                <button id="btn-next-set" class="action-btn submit">
+                    次セットへ進む →
+                </button>
+            </div>
+        </div>
+    </div>
+    <div id="mid-match-exit-modal" class="modal-overlay" style="display: none; z-index: 1300;">
+        <div class="modal-content small">
+            <h3>確認</h3>
+            <p style="text-align:center;">セットの途中ですが、試合を終了しますか？</p>
+            <div class="modal-footer" style="flex-direction: column; gap: 10px;">
+                <button id="btn-exit-cancel" class="action-btn cancel">試合続行</button>
+                <button id="btn-exit-no-save" class="action-btn" style="background-color: var(--red);">保存せずに試合終了</button>
+                <button id="btn-exit-save" class="action-btn submit">保存して試合終了</button>
+            </div>
+        </div>
+    </div>
+    <div id="match-end-modal" class="modal-overlay" style="display: none; z-index: 1300;">
+        <div class="modal-content small">
+            <h3>試合終了</h3>
+            <p style="text-align:center;">お疲れ様でした。</p>
+            <div class="modal-footer" style="flex-direction: column; gap: 10px;">
+                <button id="btn-end-to-analysis" class="action-btn submit">分析画面へ</button>
+                <button id="btn-end-to-home" class="action-btn cancel">ホームへ戻る</button>
+            </div>
+        </div>
+    </div>
+    <div id="feedback-message" class="feedback"></div>
+    <script src="html2canvas.min.js"></script>
+    <script src="jspdf.umd.min.js"></script>
+    <script src="dexie.js"></script>
+    <script src="vmetrics.js"></script>
+    </body>
+</html>
