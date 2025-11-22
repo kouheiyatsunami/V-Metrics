@@ -1083,4 +1083,9 @@ select.changed {
 .setting-card p {
     color: #ccc;
     margin-bottom: 20px;
+
+}
+/* サブモーダル（選手選択）は、通常のモーダル(2000)より手前に出す */
+#player-select-modal {
+    z-index: 2100 !important;
 }
