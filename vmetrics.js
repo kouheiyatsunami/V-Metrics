@@ -1659,7 +1659,7 @@ function cacheUIElements() {
     uiElements.playerModalTitle = document.getElementById('player-modal-title');
     uiElements.menuSettings = document.getElementById('menu-settings');
     uiElements.settingsScreen = document.getElementById('settings-screen');
-    uiElements.btnSettingsBack = document.getElementById('btn-settings-back');
+    uiElements.logoSs = document.getElementById('logo-ss');
     uiElements.btnExportCsv = document.getElementById('btn-export-csv');
     uiElements.btnDeleteAll = document.getElementById('btn-delete-all');
 
@@ -1872,8 +1872,8 @@ function setupNavigationEvents() {
             switchScreen('settings');
         });
     }
-    if (uiElements.btnSettingsBack) {
-        uiElements.btnSettingsBack.addEventListener('click', () => {
+    if (uiElements.logoSs) {
+        uiElements.logoSs.addEventListener('click', () => {
             switchScreen('home');
         });
     }
