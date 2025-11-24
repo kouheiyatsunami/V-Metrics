@@ -86,7 +86,8 @@ const GameManager = {
     },
     rotate() {
         this.state.rotation = (this.state.rotation % 6) + 1;
-        this.validateLiberoPositions();
+        const changed = this.validateLiberoPositions();
+        this.syncGlobals(); 
     },
     async restoreMatchState(matchId) {
         const summaries = await db.setSummary.where('match_id').equals(matchId).toArray();
@@ -140,19 +141,24 @@ const GameManager = {
     },
     validateLiberoPositions() {
         const activePairs = [...liberoPairs]; 
+        let hasChanged = false;
         activePairs.forEach(pair => {
-            const starter = testRoster.find(s => s.playerId === pair.playerOutId); // 元のスタメン枠
+            const starter = testRoster.find(s => s.playerId === pair.playerOutId);
             if (!starter) return;
             let visualPos = (starter.position - this.state.rotation + 1);
             if (visualPos <= 0) visualPos += 6;
-            const isFrontRow = (visualPos === 2 || visualPos === 3 || visualPos === 4);
+            const isFrontRow = (visualPos === 4 || visualPos === 3 || visualPos === 2);
             if (isFrontRow) {
-                this.updatePlayerStatus(pair.liberoId, null); // リベロ -> ベンチ(null)
+                console.log(`リベロ自動OUT: ${pair.liberoId} -> ${pair.playerOutId} (Rot:${this.state.rotation}, Pos:${visualPos})`);
+                this.updatePlayerStatus(pair.liberoId, null); 
                 const originalPlayer = testPlayerList[pair.playerOutId];
-                this.updatePlayerStatus(pair.playerOutId, originalPlayer.position); 
+                const originalRole = originalPlayer.position || 'OH'; 
+                this.updatePlayerStatus(pair.playerOutId, originalRole); 
                 liberoPairs = liberoPairs.filter(p => p.playerOutId !== pair.playerOutId);
+                hasChanged = true;
             }
         });
+        return hasChanged;
     },
     calcPointDelta(record) {
         const result = record.result;
@@ -225,6 +231,27 @@ const GameManager = {
         });
         this.syncGlobals();
         UIManager.updateScoreboard();
+    },
+    async updateScoreManual(isOur, delta) {
+        if (isOur) {
+            this.state.ourScore = Math.max(0, this.state.ourScore + delta);
+        } else {
+            this.state.opponentScore = Math.max(0, this.state.opponentScore + delta);
+        }
+        this.syncGlobals();
+        UIManager.updateScoreboard();
+        try {
+            await db.setSummary
+                .where('[match_id+set_number]')
+                .equals([this.state.matchId, this.state.setNumber])
+                .modify({
+                    our_final_score: this.state.ourScore,
+                    opponent_final_score: this.state.opponentScore
+                });
+            console.log("スコア手動更新保存完了");
+        } catch (e) {
+            console.error("スコア保存失敗", e);
+        }
     },
 };
 
@@ -389,12 +416,14 @@ const UIManager = {
                     <span class="name">${playerInfo.name}</span>
                 `;
                 gridEl.dataset.playerId = playerInfo.id;
-                // リベロなら色を変えるなどのクラス付与
-                if (playerInfo.position === 'LB' || playerInfo.position === 'Libero') {
+                if (playerInfo.active_position === 'LB') {
                     gridEl.classList.add('libero-active');
                 } else {
                     gridEl.classList.remove('libero-active');
                 }
+                gridEl.style.borderColor = '';
+                gridEl.style.borderWidth = '';
+                gridEl.style.backgroundColor = ''; 
             }
         });
         // 選手ボタンのスワイプイベントを再設定
@@ -776,7 +805,11 @@ const AnalysisManager = {
     },
     // --- 計算ロジック ---
     calculateMetrics(dataset) {
-        const TS = dataset.filter(row => row.player !== 'none').length;
+        const TS = dataset.filter(row => 
+            row.player && 
+            row.player !== 'none' && 
+            row.player !== 'NONE'
+        ).length;
         if (TS === 0) return { TS:0, TK:0, TF:0, TE:0, PK:NaN, PE:NaN, PK_Effective:NaN, PF:NaN, PC:NaN, PA:NaN, PCA:NaN, PK_HighOpp:NaN, PB:NaN, P2:NaN };
         const TK = dataset.filter(row => row.result === 'kill').length;
         const TF = dataset.filter(row => row.result === 'fault').length;
@@ -816,7 +849,10 @@ const AnalysisManager = {
     },
     calculateSpikerStats(data) {
         const stats = {};
-        const allPlayers = new Set(data.filter(row => row.player && row.player !== 'none').map(row => row.player));
+        const allPlayers = new Set(data
+            .filter(row => row.player && row.player !== 'none' && row.player !== 'NONE')
+            .map(row => row.player)
+        );
         allPlayers.forEach(player => {
             const playerData = data.filter(row => row.player === player);
             stats[player] = this.calculateMetrics(playerData);
@@ -1620,6 +1656,232 @@ const DataManager = {
         } catch (e) {
             UIManager.showFeedback("削除に失敗しました: " + e);
         }
+    },
+    async importCsvData(file) {
+        const statusEl = uiElements.importStatus;
+        statusEl.style.display = 'block';
+        statusEl.textContent = "読み込み中...";
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            const text = e.target.result;
+            try {
+                await this.processCsvText(text);
+                statusEl.textContent = "インポート完了！";
+                UIManager.showFeedback("データのインポートが完了しました。");
+                setTimeout(() => statusEl.style.display = 'none', 3000);
+            } catch (err) {
+                console.error(err);
+                statusEl.textContent = "エラーが発生しました";
+                UIManager.showFeedback("インポートに失敗しました: " + err.message);
+            }
+        };
+        reader.readAsText(file);
+    },
+    async processCsvText(text) {
+        const lines = text.split(/\r\n|\n/);
+        const headers = lines[0].split(','); 
+        if (!headers.includes('MatchDate') || !headers.includes('RallyID')) {
+            throw new Error("CSVの形式が正しくありません (V-Metrics形式ではありません)");
+        }
+        const rows = [];
+        for (let i = 1; i < lines.length; i++) {
+            if (!lines[i].trim()) continue;
+            const cols = lines[i].match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g) || [];
+            const d = cols.map(c => c.replace(/^"|"$/g, '').replace(/,$/, '')); 
+            rows.push({
+                date: d[0], comp: d[1], opp: d[2], set: Number(d[3]), rallyId: Number(d[4]),
+                rot: Number(d[6]), setterName: d[7], playerName: d[8],
+                action: d[9], result: d[10], pass: d[11], 
+                tossA: d[12], tossD: d[13], tossL: d[14], tossH: d[15]
+            });
+        }
+        const matchGroups = {};
+        rows.forEach(r => {
+            const key = `${r.date}_${r.comp}_${r.opp}`; // 一意なキー
+            if (!matchGroups[key]) matchGroups[key] = [];
+            matchGroups[key].push(r);
+        });
+        for (const key of Object.keys(matchGroups)) {
+            const groupRows = matchGroups[key];
+            const first = groupRows[0];
+            const existingMatch = await db.matchInfo
+                .filter(m => 
+                    m.match_date === first.date && 
+                    m.competition_name === first.comp && 
+                    m.opponent_name === first.opp
+                )
+                .first();
+            let shouldImport = true;
+            let deleteTargetId = null;
+            if (existingMatch) {
+                const msg = `重複する試合が見つかりました。\n\n日付: ${first.date}\n大会: ${first.comp}\n相手: ${first.opp}\n\nこの試合データを「上書き」しますか？\n(キャンセルを押すと、この試合のインポートをスキップします)`;
+                if (confirm(msg)) {
+                    deleteTargetId = existingMatch.match_id;
+                } else {
+                    shouldImport = false;
+                    console.log(`スキップしました: ${first.date} vs ${first.opp}`);
+                }
+            }
+            if (!shouldImport) continue; // 次の試合へ
+            await db.transaction('rw', db.matchInfo, db.setRoster, db.setSummary, db.rallyLog, db.playerList, async () => {
+                if (deleteTargetId !== null) {
+                    await db.matchInfo.delete(deleteTargetId);
+                    await db.setRoster.where('match_id').equals(deleteTargetId).delete();
+                    await db.setSummary.where('match_id').equals(deleteTargetId).delete();
+                    await db.rallyLog.where('match_id').equals(deleteTargetId).delete();
+                    console.log(`古いデータを削除しました (MatchID: ${deleteTargetId})`);
+                }
+                const matchId = await db.matchInfo.add({
+                    match_date: first.date,
+                    competition_name: first.comp,
+                    opponent_name: first.opp,
+                    match_type: 'imported' 
+                });
+                const setNumbers = [...new Set(groupRows.map(r => r.set))];
+                for (const setNum of setNumbers) {
+                    const setRows = groupRows.filter(r => r.set === setNum);
+                    await db.setSummary.add({
+                        match_id: matchId,
+                        set_number: setNum,
+                        our_final_score: 0, 
+                        opponent_final_score: 0,
+                        set_result: null
+                    });
+                    for (const r of setRows) {
+                        const spikerId = await this.resolvePlayerId(r.playerName);
+                        const setterId = await this.resolvePlayerId(r.setterName);
+                        await db.rallyLog.add({
+                            match_id: matchId,
+                            set_number: r.set,
+                            rally_id: r.rallyId,
+                            rotation_number: r.rot,
+                            setter_id: setterId,
+                            spiker_id: spikerId,
+                            attack_type: r.action === '-' ? null : r.action,
+                            result: r.result === '-' ? null : r.result,
+                            pass_position: r.pass === '-' ? null : r.pass,
+                            toss_area: r.tossA === '-' ? null : r.tossA,
+                            toss_distance: r.tossD === '-' ? null : r.tossD,
+                            toss_length: r.tossL === '-' ? null : r.tossL,
+                            toss_height: r.tossH === '-' ? null : r.tossH
+                        });
+                    }
+                }
+            });
+        }
+    },
+    async resolvePlayerId(name) {
+        if (!name || name === '-' || name === 'none') return null;
+        const existing = await db.playerList.where('player_name').equals(name).first();
+        if (existing) {
+            return existing.player_id;
+        } else {
+            const newId = 'p_imp_' + Date.now() + Math.floor(Math.random()*1000);
+            await db.playerList.add({
+                player_id: newId,
+                player_name: name,
+                current_jersey_number: 0,
+                position: 'OH'
+            });
+            return newId;
+        }
+    },
+    async renderExplorer() {
+        const container = document.getElementById('data-explorer');
+        if (!container) return;
+        container.innerHTML = '<p style="text-align:center;">読み込み中...</p>';
+        try {
+            const matches = await db.matchInfo.toArray();
+            const summaries = await db.setSummary.toArray();
+            if (matches.length === 0) {
+                container.innerHTML = '<p style="text-align:center; color:#888;">データがありません</p>';
+                return;
+            }
+            container.innerHTML = '';
+            matches.reverse().forEach(m => {
+                const mDiv = document.createElement('div');
+                mDiv.className = 'match-item';
+                const sets = summaries.filter(s => s.match_id === m.match_id).sort((a,b) => a.set_number - b.set_number);
+                mDiv.innerHTML = `
+                    <div class="match-header" onclick="this.nextElementSibling.classList.toggle('open')">
+                        <span>${m.match_date} vs ${m.opponent_name}</span>
+                        <span style="font-size:0.8em; color:#aaa;">▼</span>
+                    </div>
+                    <div class="set-list">
+                        </div>
+                `;
+                const setListContainer = mDiv.querySelector('.set-list');
+                if (sets.length === 0) {
+                    setListContainer.innerHTML = '<div class="set-item">セットデータなし</div>';
+                } else {
+                    sets.forEach(s => {
+                        const sDiv = document.createElement('div');
+                        sDiv.className = 'set-item';
+                        sDiv.innerHTML = `
+                            <span>第${s.set_number}セット (${s.our_final_score}-${s.opponent_final_score})</span>
+                            <div class="set-actions">
+                                <button class="action-btn btn-set-edit">修正</button>
+                                <button class="action-btn btn-set-delete">削除</button>
+                            </div>
+                        `;
+                        sDiv.querySelector('.btn-set-edit').addEventListener('click', () => {
+                            DataManager.openSetForEditing(m.match_id, s.set_number);
+                        });
+                        sDiv.querySelector('.btn-set-delete').addEventListener('click', () => {
+                            DataManager.deleteSetData(m.match_id, s.set_number);
+                        });
+                        
+                        setListContainer.appendChild(sDiv);
+                    });
+                }
+                container.appendChild(mDiv);
+            });
+        } catch (e) {
+            console.error(e);
+            container.innerHTML = '<p>エラーが発生しました</p>';
+        }
+    },
+    openSetForEditing(matchId, setNum) {
+        if (currentMatchId !== matchId) {
+            if (!confirm("現在選択中の試合とは別の試合です。\n修正モードを開きますか？\n(現在の入力内容はクリアされませんが、表示が切り替わります)")) {
+                return;
+            }
+        }
+        const tempMatchId = currentMatchId;
+        const tempSetNum = currentSetNumber;
+        currentMatchId = matchId;
+        currentSetNumber = setNum;
+        EditManager.openLogModal();
+    },
+    async deleteSetData(matchId, setNum) {
+        if (!confirm(`第${setNum}セットのデータを削除しますか？\nこの操作は取り消せません。`)) return;
+        
+        try {
+            await db.rallyLog.where('match_id').equals(matchId)
+                .filter(r => r.set_number === setNum).delete();
+            await db.setSummary.where('[match_id+set_number]').equals([matchId, setNum]).delete();
+            await db.setRoster.where('[match_id+set_number]').equals([matchId, setNum]).delete();
+            UIManager.showFeedback("削除しました。");
+            this.renderExplorer(); // リスト更新
+        } catch (e) {
+            console.error(e);
+            UIManager.showFeedback("削除に失敗しました");
+        }
+    },
+    async deleteMatchesOnly() {
+        if (!confirm("【注意】\nすべての「試合記録」を削除します。\n選手リストやスタメンパターンは残ります。\n実行しますか？")) return;
+        try {
+            await db.matchInfo.clear();
+            await db.setRoster.clear();
+            await db.setSummary.clear();
+            await db.rallyLog.clear();
+            UIManager.showFeedback("試合記録を全削除しました。");
+            this.renderExplorer();
+            GameManager.resetMatch(1, 1, null, true);
+            currentMatchId = 1;
+        } catch (e) {
+            UIManager.showFeedback("削除失敗: " + e);
+        }
     }
 };
 
@@ -1662,6 +1924,9 @@ function cacheUIElements() {
     uiElements.logoSs = document.getElementById('logo-ss');
     uiElements.btnExportCsv = document.getElementById('btn-export-csv');
     uiElements.btnDeleteAll = document.getElementById('btn-delete-all');
+    uiElements.btnImportCsv = document.getElementById('btn-import-csv');
+    uiElements.csvFileInput = document.getElementById('csv-file-input');
+    uiElements.importStatus = document.getElementById('import-status');
 
     uiElements.matchSetupModal = document.getElementById('match-setup-modal');
     uiElements.setupCompetition = document.getElementById('setup-competition');
@@ -1866,7 +2131,7 @@ function setupNavigationEvents() {
             }
         });
     }
-    // 設定画面への遷移
+    // 設定画面
     if (uiElements.menuSettings) {
         uiElements.menuSettings.addEventListener('click', () => {
             switchScreen('settings');
@@ -1877,12 +2142,41 @@ function setupNavigationEvents() {
             switchScreen('home');
         });
     }
-    // CSVエクスポート & 全削除
     if (uiElements.btnExportCsv) {
         uiElements.btnExportCsv.addEventListener('click', () => DataManager.exportAllData());
     }
     if (uiElements.btnDeleteAll) {
         uiElements.btnDeleteAll.addEventListener('click', () => DataManager.deleteAllData());
+    }
+    if (uiElements.btnImportCsv) {
+        uiElements.btnImportCsv.addEventListener('click', () => {
+            uiElements.csvFileInput.click(); // 隠しinputをクリックさせる
+        });
+    }
+    if (uiElements.csvFileInput) {
+        uiElements.csvFileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                DataManager.importCsvData(file);
+            }
+            e.target.value = '';
+        });
+    }
+    if (document.getElementById('btn-refresh-explorer')) {
+        document.getElementById('btn-refresh-explorer').addEventListener('click', () => {
+            DataManager.renderExplorer();
+        });
+    }
+    if (uiElements.menuSettings) {
+        uiElements.menuSettings.addEventListener('click', () => {
+            switchScreen('settings');
+            DataManager.renderExplorer(); // ★開くたびに更新
+        });
+    }
+    if (document.getElementById('btn-delete-matches-only')) {
+        document.getElementById('btn-delete-matches-only').addEventListener('click', () => {
+            DataManager.deleteMatchesOnly();
+        });
     }
 }
 /** B. 試合設定（スタメン・ベンチ）関連 */
@@ -1965,16 +2259,23 @@ function setupInputEvents() {
     // 特殊攻撃・ミスボタン
     uiElements.btnDirect.addEventListener('click', () => {
         resetTossQualityStates();
-        currentRallyEntry.attack_type = (currentRallyEntry.attack_type === 'DIRECT') ? null : 'DIRECT';
+        if (currentRallyEntry.attack_type === 'DIRECT') {
+            currentRallyEntry.attack_type = null;
+            currentRallyEntry.setter_id = currentSetterId;
+        } else {
+            currentRallyEntry.attack_type = 'DIRECT';
+            currentRallyEntry.setter_id = null; // ★NULLにする
+        }
         updateInputDisplay();
     });
     uiElements.btnTwoAttack.addEventListener('click', () => {
         resetTossQualityStates();
         if (currentRallyEntry.attack_type === 'TWO_ATTACK') {
             currentRallyEntry.attack_type = null;
+            currentRallyEntry.setter_id = currentSetterId;
         } else {
             currentRallyEntry.attack_type = 'TWO_ATTACK';
-            currentRallyEntry.setter_id = currentRallyEntry.spiker_id || currentSetterId;
+            currentRallyEntry.setter_id = null; // ★NULLにする
         }
         updateInputDisplay();
     });
@@ -1999,7 +2300,6 @@ function setupInputEvents() {
     uiElements.btnAdd.addEventListener('click', addRallyEntryToDB);
 }
 /** E. スコアボード操作 */
-/** E. スコアボード操作 (修正版) */
 function setupScoreboardEvents() {
     // 自チーム +
     uiElements.btnSelfPlus.addEventListener('click', () => {
@@ -2007,30 +2307,26 @@ function setupScoreboardEvents() {
             GameManager.state.rotation = (GameManager.state.rotation % 6) + 1;
             updateSpikerUIRotation(GameManager.state.rotation);
         }
-        GameManager.state.ourScore++;
         GameManager.state.isOurServing = true;
-        GameManager.syncGlobals();
+        GameManager.updateScoreManual(true, 1);
         UIManager.updateScoreboard();
     });
     // 自チーム -
     uiElements.btnSelfMinus.addEventListener('click', () => {
-        GameManager.state.ourScore = Math.max(0, GameManager.state.ourScore - 1);
         GameManager.state.isOurServing = false; // 相手に移動(取り消し想定)
-        GameManager.syncGlobals(); // ★重要
+        GameManager.updateScoreManual(true, -1);
         UIManager.updateScoreboard();
     });
     // 相手チーム +
     uiElements.btnOppPlus.addEventListener('click', () => {
-        GameManager.state.opponentScore++;
         GameManager.state.isOurServing = false;
-        GameManager.syncGlobals(); // ★重要
+        GameManager.updateScoreManual(false, 1);
         UIManager.updateScoreboard();
     });
     // 相手チーム -
     uiElements.btnOppMinus.addEventListener('click', () => {
-        GameManager.state.opponentScore = Math.max(0, GameManager.state.opponentScore - 1);
         GameManager.state.isOurServing = true;
-        GameManager.syncGlobals(); // ★重要
+        GameManager.updateScoreManual(false, -1);
         UIManager.updateScoreboard();
     });
     // サーブ権強制切替
@@ -2163,11 +2459,11 @@ function handlePassStart(e) {
         const relativeY = (touchY - courtRect.top) / courtRect.height * 100;
         const A_CENTER_X = 55;   // 右奥
         const A_CENTER_Y = 0;    // ネット際
-        const A_RADIUS = 25;     // 半径
+        const A_RADIUS = 20;     // 半径
         const distSq = Math.pow(relativeX - A_CENTER_X, 2) + Math.pow(relativeY - A_CENTER_Y, 2);
         if (Math.sqrt(distSq) <= A_RADIUS) {
             finalPassQuality = 'A'; 
-        } else if (relativeX >= 33 && relativeY <= 30) {
+        } else if (relativeX >= 30 && relativeY <= 33) {
             finalPassQuality = 'B'; 
         } else {
             finalPassQuality = 'S2'; 
@@ -2479,8 +2775,8 @@ function updateRallyOnSwipe(playerId, direction) {
     }
     currentRallyEntry.spiker_id = playerId;
     currentRallyEntry.result = result;
-    if (currentRallyEntry.attack_type === 'TWO_ATTACK') {
-        currentRallyEntry.setter_id = playerId;
+    if (currentRallyEntry.attack_type === 'TWO_ATTACK' || currentRallyEntry.attack_type === 'DIRECT') {
+        currentRallyEntry.setter_id = null;
     }
     const tossArea = currentRallyEntry.toss_area || 'UNKNOWN';
     const determinedAttackType = determineAttackType(playerId, tossArea);
@@ -2822,12 +3118,18 @@ function getBackRowPlayers() {
     return players;
 }
 function switchScreen(screenName) {
-    uiElements.homeScreen.style.display = 'none';
-    uiElements.recordScreen.style.display = 'none';
-    uiElements.playersScreen.style.display = 'none';
-    const analysisScreen = document.getElementById('analysis-screen');
-    if(analysisScreen) analysisScreen.style.display = 'none';
-
+    const screens = [
+        'home-screen', 
+        'record-screen', 
+        'players-screen', 
+        'analysis-screen', 
+        'settings-screen',
+        'timeout-screen'
+    ];
+    screens.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
     switch (screenName) {
         case 'home':
             uiElements.homeScreen.style.display = 'flex';
@@ -2838,11 +3140,13 @@ function switchScreen(screenName) {
         case 'players':
             uiElements.playersScreen.style.display = 'flex';
             break;
-        case 'analysis': 
-            if(analysisScreen) analysisScreen.style.display = 'flex'; 
+        case 'analysis':
+            const analysis = document.getElementById('analysis-screen');
+            if (analysis) analysis.style.display = 'flex';
             break;
         case 'settings':
-            if(uiElements.settingsScreen) uiElements.settingsScreen.style.display = 'block';
+            const settings = document.getElementById('settings-screen');
+            if (settings) settings.style.display = 'block';
             break;
     }
 }
@@ -2943,6 +3247,9 @@ async function openMatchSetupModal() {
     uiElements.setupMatchType.disabled = false;
     uiElements.btnMatchStart.style.display = 'inline-block';
     uiElements.btnNextSetStart.style.display = 'none';
+    if (uiElements.btnSetupCancel) {
+        uiElements.btnSetupCancel.style.display = '';
+    }
     try {
         allPlayersCache = await db.playerList.toArray();
         allPlayersCache.sort((a, b) => Number(a.current_jersey_number) - Number(b.current_jersey_number));
@@ -2986,6 +3293,9 @@ function openMatchSetupModalForNextSet() {
     uiElements.setupMatchType.disabled = true;
     uiElements.btnMatchStart.style.display = 'none';
     uiElements.btnNextSetStart.style.display = 'inline-block';
+    if (uiElements.btnSetupCancel) {
+        uiElements.btnSetupCancel.style.display = 'none';
+    }
     tempStarters = {};
     testRoster.forEach(entry => {
         const player = testPlayerList[entry.playerId];
@@ -3386,7 +3696,8 @@ function processPointEnd(didOurTeamWin) {
     currentRallyEntry.rotation_number = currentRotation;
     updateSpikerUIRotation(currentRotation);
     updateScoreboardDisplay();
-    updateScoreboardUI(); 
+    updateScoreboardUI();
+    populateInGameDropdowns();
 }
 function toggleServerManually() {
     isOurTeamServing = !isOurTeamServing; 
@@ -3420,11 +3731,30 @@ function determineAttackType(spikerId, tossArea) {
     }
     return 'SPIKE';
 }
-function handleMatchExitRequest() {
+async function handleMatchExitRequest() {
     const s1 = GameManager.state.ourScore;
     const s2 = GameManager.state.opponentScore;
     if (s1 === 0 && s2 === 0) {
-        showMatchEndModal();
+        const mId = GameManager.state.matchId;
+        const sNum = GameManager.state.setNumber;
+        try {
+            await db.rallyLog.where('match_id').equals(mId)
+                .filter(r => r.set_number === sNum).delete();
+            await db.setSummary.where('[match_id+set_number]').equals([mId, sNum]).delete();
+            await db.setRoster.where('[match_id+set_number]').equals([mId, sNum]).delete();
+            if (sNum === 1) {
+                await db.matchInfo.delete(mId);
+                console.log(`試合(ID:${mId})作成をキャンセルしました。`);
+                UIManager.showFeedback("試合作成をキャンセルしてホームに戻りました。");
+            } else {
+                console.log(`セット${sNum}のデータを破棄しました。`);
+                UIManager.showFeedback("記録のないセットを破棄してホームに戻りました。");
+            }
+            switchScreen('home');
+        } catch (err) {
+            console.error("自動削除エラー:", err);
+            switchScreen('home');
+        }
     } else {
         uiElements.midMatchExitModal.style.display = 'flex';
     }

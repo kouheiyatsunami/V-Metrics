@@ -128,7 +128,19 @@ body, html {
 /* =========================================
    4. 記録画面 (Record Screen)
    ========================================= */
-#record-screen { display: flex; height: 100%; }
+#record-screen {
+    display: flex;
+    height: 100vh;
+    box-sizing: border-box; /* パディングを含めた高さ計算 */
+    padding-top: max(20px, env(safe-area-inset-top)); 
+    padding-bottom: env(safe-area-inset-bottom); /* 下部のバー対策も念のため */
+    background-color: #333;
+}
+#left-pane, #right-pane {
+    /* 親要素(#record-screen)のpaddingを除いた残りの高さを埋める */
+    height: 100%; 
+    box-sizing: border-box;
+}
 
 /* --- 左エリア (コート・選手) --- */
 #left-pane {
@@ -883,6 +895,9 @@ select.changed {
 }
 #btn-rotate-left { left: -50px; }
 #btn-rotate-right { right: -50px; }
+#player-select-modal {
+    z-index: 2100 !important;
+}
 
 /* ログリスト (モーダル内) */
 .log-list {
@@ -1083,9 +1098,40 @@ select.changed {
 .setting-card p {
     color: #ccc;
     margin-bottom: 20px;
-
 }
-/* サブモーダル（選手選択）は、通常のモーダル(2000)より手前に出す */
-#player-select-modal {
-    z-index: 2100 !important;
+/* --- データエクスプローラー --- */
+.match-item {
+    background-color: #333;
+    border-bottom: 1px solid #555;
+    padding: 10px;
 }
+.match-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--orange);
+    font-weight: bold;
+    cursor: pointer;
+}
+.set-list {
+    margin-top: 10px;
+    padding-left: 15px;
+    display: none; /* デフォルト非表示 (アコーディオン) */
+}
+.set-list.open {
+    display: block;
+}
+.set-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px;
+    border-bottom: 1px dashed #444;
+    color: #ccc;
+}
+.set-actions {
+    display: flex;
+    gap: 5px;
+}
+.btn-set-edit { background-color: var(--navy); padding: 5px 10px; font-size: 12px; }
+.btn-set-delete { background-color: var(--red); padding: 5px 10px; font-size: 12px; }

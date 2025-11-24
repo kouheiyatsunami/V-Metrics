@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="V-Metrics">
     <link rel="apple-touch-icon" href="V-Metrics.white.png"> <link rel="manifest" href="manifest.json">
-    <link rel="icon" href="V-Metrics.white.png" type="image/png">
+    <link rel="icon" href="V-Metrics.png" type="image/png">
     <title>V-Metrics</title>
     <link rel="stylesheet" href="style.css">
 </head>
@@ -28,11 +28,11 @@
             </div>
             <div class="menu-card" id="menu-players">
                 <h2>選手管理</h2>
-                <p>名簿・背番号の登録</p>
+                <p>選手名や背番号を登録する</p>
             </div>
             <div class="menu-card" id="menu-settings">
                 <h2>設定</h2>
-                <p>データ管理・その他</p>
+                <p>データの修正・削除、CSV出入力</p>
             </div>
         </div>
     </div>
@@ -63,7 +63,7 @@
             <div class="modal-body">
                 <input type="hidden" id="edit-player-id"> <div class="select-group">
                     <label>名&nbsp;前</label>
-                    <input type="text" id="input-player-name" placeholder="例: 山梨 太郎">
+                    <input type="text" id="input-player-name" placeholder="例: 山梨太郎">
                 </div>
                 <div class="select-group">
                     <label>背番号</label>
@@ -91,29 +91,37 @@
             <img src="logo.png" alt="V-Metrics" id="logo-ss" class="logo-image" />
             <h1>設定・データ管理</h1>
         </header>
-        <div class="settings-content" style="padding: 20px; max-width: 800px; margin: 0 auto;">
+        <div class="settings-content" style="padding: 20px; max-width: 900px; margin: 0 auto; padding-bottom: 100px;">
             <div class="setting-card">
-                <h3>データの書き出し (エクスポート)</h3>
-                <p>記録した全データをCSVファイルとしてダウンロードします。Excelで開くことができます。</p>
-                <button id="btn-export-csv" class="action-btn submit">
-                    📥 全データをCSVで出力
-                </button>
+                <h3>データの入出力</h3>
+                <div style="display:flex; gap:10px; margin-top:10px;">
+                    <button id="btn-export-csv" class="action-btn submit" style="flex:1;">CSVエクスポート</button>
+                    <button id="btn-import-csv" class="action-btn" style="flex:1; background-color: var(--navy);">CSVインポート</button>
+                    <input type="file" id="csv-file-input" accept=".csv" style="display: none;">
+                </div>
+                <p id="import-status" style="color: var(--orange); margin-top: 5px; display: none;"></p>
             </div>
-            <div class="setting-card" style="margin-top: 20px;">
-                <h3>データの読み込み (インポート)</h3>
-                <p>CSVファイルを読み込んでデータを復元します。</p>
-                <button id="btn-import-csv" class="action-btn" disabled>
-                    📤 インポート (未実装)
-                </button>
+            <div class="setting-card">
+                <h3>データの修正・削除</h3>
+                <p>試合やセットを選んで、データの修正や削除ができます。</p>
+                <div id="data-explorer" style="max-height: 400px; overflow-y: auto; border: 1px solid #555; border-radius: 5px; background: #222; padding: 10px;">
+                    <p style="text-align:center; color:#888;">データを読み込んでいます...</p>
+                </div>
+                <div style="margin-top:10px; text-align:right;">
+                    <button id="btn-refresh-explorer" class="action-btn small">リスト更新</button>
+                </div>
             </div>
-            <div class="setting-card" style="margin-top: 20px; border-color: var(--red);">
-                <h3 style="color: var(--red);">データ削除</h3>
-                <p>すべての試合データと選手データを削除します。この操作は取り消せません。</p>
-                <button id="btn-delete-all" class="action-btn undo">
-                    🗑️ 全データを削除
-                </button>
+            <div class="setting-card" style="border-color: var(--red);">
+                <h3 style="color: var(--red);">データ初期化</h3>
+                <div style="display:flex; flex-direction:column; gap:10px;">
+                    <button id="btn-delete-matches-only" class="action-btn" style="background-color: #c0392b;">
+                        試合データ全削除
+                    </button>
+                    <button id="btn-delete-all" class="action-btn undo">
+                        全てのデータを削除
+                    </button>
+                </div>
             </div>
-
         </div>
     </div>
     <div id="analysis-screen" style="display: none;">
@@ -126,8 +134,8 @@
                 <select id="analysis-opponent-select" class="filter-select">
                     <option value="all">対戦校 (全員)</option>
                     </select>
-                <button id="btn-calc-stats" class="action-btn submit">集計</button>
-                <button id="btn-share-report" class="action-btn" style="background-color:#f39c12; color:black;">共有</button>
+                <button id="btn-calc-stats" class="action-btn submit">集&nbsp;計</button>
+                <button id="btn-share-report" class="action-btn" style="background-color:var(--orange); color:black;">共&nbsp;有</button>
             </div>
         </header>
         <div class="analysis-main">
@@ -440,7 +448,7 @@
                 </div>
                 <button class="action-btn" id="btn-substitute">選手交代</button>
                 <button class="action-btn" id="btn-libero">リベロ IN</button>
-                <button class="action-btn undo" id="btn-undo">↩&emsp;取&nbsp;消</button>
+                <button class="action-btn undo" id="btn-undo">取&nbsp;消</button>
                 <button class="action-btn" id="btn-open-log">履歴・修正</button>
                 <div id="current-inputs" class="span-2">
                     <div class="input-row three-buttons">
@@ -702,6 +710,4 @@
     <script src="dexie.js"></script>
     <script src="vmetrics.js"></script>
     </body>
-
 </html>
-
