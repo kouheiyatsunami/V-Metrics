@@ -1,3 +1,49 @@
+// --- アプリ全体の初期化と設定 ---
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator) {
+            let wakeLock = null;
+            const request = async () => {
+                try {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                    console.log('Wake Lock is active (画面スリープ防止中)');
+                } catch (err) {
+                    console.error(`Wake Lock Error: ${err.name}, ${err.message}`);
+                }
+            };
+            
+            // 初回リクエスト
+            await request();
+
+            // タブ切り替えなどで解除されたら再取得するリスナー
+            document.addEventListener('visibilitychange', async () => {
+                if (wakeLock !== null && document.visibilityState === 'visible') {
+                    await request();
+                }
+            });
+        }
+    } catch (err) {
+        console.warn("Wake Lock API not supported on this browser");
+    }
+}
+async function initialize() {
+    console.log("V-Metrics Initializing...");
+    // 1. UI要素の取得
+    cacheUIElements();
+    // 2. イベントリスナーの設定
+    setupEventListeners();
+    // 3. 画面スリープ防止の開始
+    await requestWakeLock();
+    // 4. 画面状態の復元 (既存のグローバル変数を使って描画)
+    updateSpikerUIRotation(currentRotation);
+    updateInputDisplay();
+    updateScoreboardUI();
+    console.log("V-Metrics Ready.");
+}
+document.addEventListener('DOMContentLoaded', () => {
+    initialize();
+});
+
 // --- データベース定義 (変更なし) ---
 const db = new Dexie('VMetricsDB');
 db.version(1).stores({
@@ -1854,35 +1900,56 @@ const DataManager = {
         EditManager.openLogModal();
     },
     async deleteSetData(matchId, setNum) {
-        if (!confirm(`第${setNum}セットのデータを削除しますか？\nこの操作は取り消せません。`)) return;
-        
+        if (!confirm(`第${setNum}セットのデータを削除しますか？\nこの操作は取り消せません。`)) return;       
         try {
-            await db.rallyLog.where('match_id').equals(matchId)
-                .filter(r => r.set_number === setNum).delete();
-            await db.setSummary.where('[match_id+set_number]').equals([matchId, setNum]).delete();
-            await db.setRoster.where('[match_id+set_number]').equals([matchId, setNum]).delete();
-            UIManager.showFeedback("削除しました。");
-            this.renderExplorer(); // リスト更新
+            await db.transaction('rw', db.matchInfo, db.setRoster, db.setSummary, db.rallyLog, async () => {
+                await db.rallyLog.where('match_id').equals(matchId)
+                    .filter(r => r.set_number === setNum).delete();
+                await db.setSummary.where('[match_id+set_number]').equals([matchId, setNum]).delete();
+                await db.setRoster.where('[match_id+set_number]').equals([matchId, setNum]).delete();
+                const remainingSummaries = await db.setSummary.where('match_id').equals(matchId).toArray();
+                if (remainingSummaries.length === 0) {
+                    await db.matchInfo.delete(matchId);
+                    UIManager.showFeedback("全てのセットが削除されたため、試合記録自体を削除しました。");
+                    if (currentMatchId === matchId) {
+                        GameManager.resetMatch(1, 1, null, true);
+                    }
+                } else {
+                    remainingSummaries.sort((a, b) => a.set_number - b.set_number);
+                    let shiftOccurred = false;
+                    for (const summary of remainingSummaries) {
+                        if (summary.set_number > setNum) {
+                            const oldSetNum = summary.set_number;
+                            const newSetNum = oldSetNum - 1; // 1つ前にずらす
+                            await db.rallyLog.where('match_id').equals(matchId)
+                                .filter(r => r.set_number === oldSetNum)
+                                .modify({ set_number: newSetNum });
+                            await db.setSummary.where('[match_id+set_number]').equals([matchId, oldSetNum]).delete();
+                            summary.set_number = newSetNum;
+                            await db.setSummary.add(summary);
+                            const rosters = await db.setRoster.where('[match_id+set_number]').equals([matchId, oldSetNum]).toArray();
+                            await db.setRoster.where('[match_id+set_number]').equals([matchId, oldSetNum]).delete();
+                            rosters.forEach(r => {
+                                r.set_number = newSetNum;
+                                delete r.set_roster_id; // IDは自動採番させるため削除
+                            });
+                            await db.setRoster.bulkAdd(rosters);
+                            shiftOccurred = true;
+                        }
+                    }
+                    if (shiftOccurred) {
+                        UIManager.showFeedback("削除しました。\n以降のセット番号を自動的に繰り上げました。");
+                    } else {
+                        UIManager.showFeedback("削除しました。");
+                    }
+                }
+            });
+            this.renderExplorer(); 
         } catch (e) {
             console.error(e);
-            UIManager.showFeedback("削除に失敗しました");
+            UIManager.showFeedback("削除処理中にエラーが発生しました");
         }
     },
-    async deleteMatchesOnly() {
-        if (!confirm("【注意】\nすべての「試合記録」を削除します。\n選手リストやスタメンパターンは残ります。\n実行しますか？")) return;
-        try {
-            await db.matchInfo.clear();
-            await db.setRoster.clear();
-            await db.setSummary.clear();
-            await db.rallyLog.clear();
-            UIManager.showFeedback("試合記録を全削除しました。");
-            this.renderExplorer();
-            GameManager.resetMatch(1, 1, null, true);
-            currentMatchId = 1;
-        } catch (e) {
-            UIManager.showFeedback("削除失敗: " + e);
-        }
-    }
 };
 
 // DOMが読み込まれたら実行
@@ -2607,7 +2674,6 @@ function handleAttackTypeChange() {
  * 6. DBに「追加」する処理 (「追加」ボタンで呼び出し)
  */
 async function addRallyEntryToDB() {
-    // 不足しているグローバル情報を最終セット
     currentRallyEntry.match_id = currentMatchId;
     currentRallyEntry.set_number = currentSetNumber;
     currentRallyEntry.rotation_number = currentRotation;
@@ -2632,6 +2698,7 @@ async function addRallyEntryToDB() {
     let didOurTeamWin = null;
     if (pointDelta === 1) didOurTeamWin = true;
     if (pointDelta === -1) didOurTeamWin = false;
+    if (uiElements.btnAdd) uiElements.btnAdd.disabled = true;
     try {
         const id = await db.rallyLog.add(currentRallyEntry);
         console.log(`【DB保存成功】Play ID: ${id}`);
@@ -2641,6 +2708,8 @@ async function addRallyEntryToDB() {
         resetCurrentEntry();
     } catch (err) {
         console.error('【DB保存失敗】', err, currentRallyEntry);
+    } finally {
+        if (uiElements.btnAdd) uiElements.btnAdd.disabled = false;
     }
 }
 
@@ -3146,7 +3215,7 @@ function switchScreen(screenName) {
             break;
         case 'settings':
             const settings = document.getElementById('settings-screen');
-            if (settings) settings.style.display = 'block';
+            if (settings) settings.style.display = 'flex';
             break;
     }
 }
