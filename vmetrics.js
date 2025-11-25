@@ -86,9 +86,16 @@ const GameManager = {
         isOurServing: true,
         isSliding: false
     },
+    liberoMap: {},
     history: [],
+    get current() {
+        return this.state;
+    },
     saveSnapshot() {
-        const snapshot = JSON.parse(JSON.stringify(this.state));
+        const snapshot = {
+            state: JSON.parse(JSON.stringify(this.state)),
+            liberoMap: JSON.parse(JSON.stringify(this.liberoMap))
+        };
         this.history.push(snapshot);
         if (this.history.length > 10) this.history.shift();
     },
@@ -97,9 +104,12 @@ const GameManager = {
             UIManager.showFeedback("これ以上戻れません。");
             return false;
         }
-        const prevState = this.history.pop();
-        this.state = prevState; // 状態を丸ごと書き戻す
-        this.syncGlobals();     // グローバル変数にも反映
+        const prev = this.history.pop();
+        this.state = prev.state;
+        this.liberoMap = prev.liberoMap;
+        this.syncGlobals();
+        updateSpikerUIRotation(this.state.rotation);
+        populateInGameDropdowns();
         return true;
     },
     resetMatch(matchId, startRotation, startSetterId, isOurServe) {
@@ -116,11 +126,11 @@ const GameManager = {
         this.syncGlobals(); // グローバル変数にも反映
     },
     addScore(isOurPoint) {
-        this.saveSnapshot();
+        this.saveSnapshot(); // 履歴保存
         if (isOurPoint) {
             this.state.ourScore++;
             if (!this.state.isOurServing) {
-                this.rotate();
+                this.rotate(); 
             }
             this.state.isOurServing = true;
         } else {
@@ -128,12 +138,51 @@ const GameManager = {
             this.state.isOurServing = false;
         }
         this.state.rallyId++;
-        this.syncGlobals(); // グローバル変数にも反映
+        this.syncGlobals();
+        UIManager.updateScoreboard(); // 得点板更新
     },
     rotate() {
         this.state.rotation = (this.state.rotation % 6) + 1;
-        const changed = this.validateLiberoPositions();
+        console.log(`Rotated to: ${this.state.rotation}`);
+        this.checkLiberoRotation();
         this.syncGlobals(); 
+        updateSpikerUIRotation(this.state.rotation);
+    },
+    checkLiberoRotation() {
+        const rotation = this.state.rotation;
+        const originalPlayerIds = Object.keys(this.liberoMap);
+        if (originalPlayerIds.length === 0) return;
+        originalPlayerIds.forEach(originalId => {
+            const rosterItem = testRoster.find(r => r.playerId === originalId);
+            if (!rosterItem) {
+                console.warn(`Roster data not found for ${originalId}`);
+                return;
+            }
+            let currentPos = (rosterItem.position - rotation + 1);
+            if (currentPos <= 0) currentPos += 6;
+            if ([2, 3, 4].includes(currentPos)) {
+                const liberoId = this.liberoMap[originalId];
+                const libName = testPlayerList[liberoId]?.name || 'リベロ';
+                const orgName = testPlayerList[originalId]?.name || '元選手';
+                console.log(`Auto OUT Triggered for ${libName}`);
+                UIManager.showFeedback(`前衛にローテしたため、\n${libName} と ${orgName} を交代しました。`);
+                this.executeLiberoSwap(liberoId, originalId, false); // false = OUT処理
+            }
+        });
+    },
+    executeLiberoSwap(liberoId, originalId, isEntering) {
+        if (isEntering) {
+            this.liberoMap[originalId] = liberoId;
+            this.updatePlayerStatus(originalId, null); // 元選手はベンチへ
+            this.updatePlayerStatus(liberoId, 'LB');   // リベロはコートへ
+        } else {
+            delete this.liberoMap[originalId];
+            this.updatePlayerStatus(liberoId, null); // リベロはベンチへ
+            const originalRole = testPlayerList[originalId]?.position || 'MB';
+            this.updatePlayerStatus(originalId, originalRole); // 元選手復帰
+        }
+        updateSpikerUIRotation(this.state.rotation);
+        populateInGameDropdowns();
     },
     async restoreMatchState(matchId) {
         const summaries = await db.setSummary.where('match_id').equals(matchId).toArray();
@@ -176,7 +225,17 @@ const GameManager = {
         }
     },
     getPlayersOnCourt() {
-        return Object.values(testPlayerList).filter(p => p.active_position !== null);
+        const players = [];
+        testRoster.forEach(starter => {
+            const originalId = starter.playerId;
+            if (this.liberoMap[originalId]) {
+                const liberoId = this.liberoMap[originalId];
+                if (testPlayerList[liberoId]) players.push(testPlayerList[liberoId]);
+            } else {
+                if (testPlayerList[originalId]) players.push(testPlayerList[originalId]);
+            }
+        });
+        return players;
     },
     getCurrentSetter() {
         const setter = Object.values(testPlayerList).find(p => p.active_position === 'S');
@@ -184,27 +243,6 @@ const GameManager = {
     },
     getCurrentLiberos() {
         return Object.values(testPlayerList).filter(p => p.active_position === 'LB');
-    },
-    validateLiberoPositions() {
-        const activePairs = [...liberoPairs]; 
-        let hasChanged = false;
-        activePairs.forEach(pair => {
-            const starter = testRoster.find(s => s.playerId === pair.playerOutId);
-            if (!starter) return;
-            let visualPos = (starter.position - this.state.rotation + 1);
-            if (visualPos <= 0) visualPos += 6;
-            const isFrontRow = (visualPos === 4 || visualPos === 3 || visualPos === 2);
-            if (isFrontRow) {
-                console.log(`リベロ自動OUT: ${pair.liberoId} -> ${pair.playerOutId} (Rot:${this.state.rotation}, Pos:${visualPos})`);
-                this.updatePlayerStatus(pair.liberoId, null); 
-                const originalPlayer = testPlayerList[pair.playerOutId];
-                const originalRole = originalPlayer.position || 'OH'; 
-                this.updatePlayerStatus(pair.playerOutId, originalRole); 
-                liberoPairs = liberoPairs.filter(p => p.playerOutId !== pair.playerOutId);
-                hasChanged = true;
-            }
-        });
-        return hasChanged;
     },
     calcPointDelta(record) {
         const result = record.result;
@@ -426,12 +464,12 @@ const UIManager = {
             }
         }
     },
-    // コート上の選手配置（ローテーション）更新
+    // リベロ交代のUI
     updateCourtRotation(rotation) {
-        const playerOutToLibero = {};
-        liberoPairs.forEach(pair => playerOutToLibero[pair.playerOutId] = pair.liberoId);
+        const activeLiberoIds = Object.values(GameManager.liberoMap);
+        const isLiberoIn = activeLiberoIds.length > 0;
         // リベロボタンの見た目更新
-        if (liberoPairs.length > 0) {
+        if (isLiberoIn) {
             uiElements.btnLibero.classList.add('libero-in');
             uiElements.btnLibero.textContent = 'リベロ OUT';
         } else {
@@ -442,18 +480,13 @@ const UIManager = {
         testRoster.forEach(starter => {
             let visualPos = (starter.position - rotation + 1);
             if (visualPos <= 0) visualPos += 6;
-            const starterId = starter.playerId;
-            let playerInfo = testPlayerList[starterId];
-            // リベロ判定ロジック
-            const isBackRow = (visualPos === 1 || visualPos === 6 || visualPos === 5);
-            const pairedLiberoId = playerOutToLibero[starterId];
-
-            if (pairedLiberoId && isBackRow) {
-                playerInfo = testPlayerList[pairedLiberoId]; // リベロと交代中
-            } else if (pairedLiberoId && !isBackRow) {
-                // 前衛に上がったのでリベロは自動で下がる（データ上の同期は別途必要だが表示は元に戻す）
-                playerInfo = testPlayerList[starterId];
+            const originalPlayerId = starter.playerId;
+            let displayPlayerId = originalPlayerId;
+            // ★修正: このポジションの選手がリベロと交代中かチェック
+            if (GameManager.liberoMap[originalPlayerId]) {
+                displayPlayerId = GameManager.liberoMap[originalPlayerId]; // リベロのIDを表示
             }
+            const playerInfo = testPlayerList[displayPlayerId];
             // DOM書き換え
             const gridEl = uiElements.spikerGridPositions[visualPos];
             if (gridEl && playerInfo) {
@@ -462,7 +495,7 @@ const UIManager = {
                     <span class="name">${playerInfo.name}</span>
                 `;
                 gridEl.dataset.playerId = playerInfo.id;
-                if (playerInfo.active_position === 'LB') {
+                if (playerInfo.position === 'LB' || playerInfo.active_position === 'LB') {
                     gridEl.classList.add('libero-active');
                 } else {
                     gridEl.classList.remove('libero-active');
@@ -472,9 +505,6 @@ const UIManager = {
                 gridEl.style.backgroundColor = ''; 
             }
         });
-        // 選手ボタンのスワイプイベントを再設定
-        const playerButtons = document.querySelectorAll('.player-button');
-        setupSwipeListeners(playerButtons);
     }
 };
 const EditManager = {
@@ -1681,7 +1711,10 @@ const DataManager = {
             const url = URL.createObjectURL(blob);
             const link = document.createElement("a");
             link.setAttribute("href", url);
-            const timestamp = new Date().toISOString().slice(0,10).replace(/-/g,"");
+            const now = new Date();
+            const timestamp = now.getFullYear() +
+                String(now.getMonth() + 1).padStart(2, '0') +
+                String(now.getDate()).padStart(2, '0');
             link.setAttribute("download", `VMetrics_Data_${timestamp}.csv`);
             document.body.appendChild(link);
             link.click();
@@ -1876,7 +1909,6 @@ const DataManager = {
                         sDiv.querySelector('.btn-set-delete').addEventListener('click', () => {
                             DataManager.deleteSetData(m.match_id, s.set_number);
                         });
-                        
                         setListContainer.appendChild(sDiv);
                     });
                 }
@@ -2104,7 +2136,12 @@ function resetAttackTypeStates() {
 /**
  * 4. イベントリスナー設定（メイン）
  */
+let isEventListenersSetup = false;
 function setupEventListeners() {
+    if (isEventListenersSetup) {
+        console.log("Event listeners already setup. Skipping.");
+        return;
+    }
     setupNavigationEvents();   // 画面遷移・メニュー
     setupMatchSetupEvents();   // 試合開始前の設定
     setupCourtEvents();        // コート上の操作（トス・スワイプ）
@@ -2124,6 +2161,7 @@ function setupEventListeners() {
             }
         });
     }
+    isEventListenersSetup = true;
 }
 /** A. 画面遷移・メニュー関連 */
 function setupNavigationEvents() {
@@ -2368,33 +2406,21 @@ function setupInputEvents() {
 }
 /** E. スコアボード操作 */
 function setupScoreboardEvents() {
-    // 自チーム +
+    // 自チーム + 
     uiElements.btnSelfPlus.addEventListener('click', () => {
-        if (!GameManager.state.isOurServing) {
-            GameManager.state.rotation = (GameManager.state.rotation % 6) + 1;
-            updateSpikerUIRotation(GameManager.state.rotation);
-        }
-        GameManager.state.isOurServing = true;
-        GameManager.updateScoreManual(true, 1);
-        UIManager.updateScoreboard();
+        GameManager.addScore(true);
     });
-    // 自チーム -
+    // 自チーム - (訂正用)
     uiElements.btnSelfMinus.addEventListener('click', () => {
-        GameManager.state.isOurServing = false; // 相手に移動(取り消し想定)
         GameManager.updateScoreManual(true, -1);
-        UIManager.updateScoreboard();
     });
     // 相手チーム +
     uiElements.btnOppPlus.addEventListener('click', () => {
-        GameManager.state.isOurServing = false;
-        GameManager.updateScoreManual(false, 1);
-        UIManager.updateScoreboard();
+        GameManager.addScore(false);
     });
-    // 相手チーム -
+    // 相手チーム - (訂正用)
     uiElements.btnOppMinus.addEventListener('click', () => {
-        GameManager.state.isOurServing = true;
         GameManager.updateScoreManual(false, -1);
-        UIManager.updateScoreboard();
     });
     // サーブ権強制切替
     uiElements.btnServerToggle.addEventListener('click', toggleServerManually);
@@ -2410,13 +2436,6 @@ function setupSubstitutionEvents() {
     }
     if (uiElements.btnSubExecute) {
         uiElements.btnSubExecute.addEventListener('click', executeSubstitution);
-    }
-    if (uiElements.btnConfirmSub) {
-        uiElements.btnConfirmSub.addEventListener('click', () => {
-            executeSubstitution(userSelectedInId, userSelectedOutId); 
-            closeSubstitutionPopup(); 
-            updateInputDisplay();
-        });
     }
     // リベロ交代
     setupLiberoButtonEvents(uiElements.btnLibero);
@@ -3031,43 +3050,47 @@ function setupLiberoButtonEvents(button) {
     button.addEventListener('touchcancel', () => { if (timer) clearTimeout(timer); });
 }
 function handleLiberoTap() {
-    if (liberoPairs.length > 0) {
+    const activeLiberoOriginalIds = Object.keys(GameManager.liberoMap);
+    const isLiberoActive = activeLiberoOriginalIds.length > 0;
+    if (isLiberoActive) {
+        // --- リベロ OUT モード ---
         uiElements.liberoModalTitle.textContent = 'リベロ交代 (OUT)';
-        const activePair = liberoPairs[0]; 
-        const liberoObj = Object.values(testLiberos).find(l => l.id === activePair.liberoId);
-        const originalPlayer = testPlayerList[activePair.playerOutId];
+        const originalId = activeLiberoOriginalIds[0]; 
+        const liberoId = GameManager.liberoMap[originalId];
+        const liberoObj = testPlayerList[liberoId];
+        const originalPlayer = testPlayerList[originalId];
         if (!liberoObj || !originalPlayer) {
-            UIManager.showFeedback("データエラーが発生しました。リベロ設定を確認してください。");
+            UIManager.showFeedback("選手データが見つかりません。");
             return;
         }
         let html = `
             <div class="select-group">
-                <label>OUTする選手 (リベロ)</label>
-                <p style="font-size: 1.2em; font-weight: bold; color: yellow;">
+                <label>OUTする選手</label>
+                <p style="font-size: 1.2em; font-weight: bold; color: var(--accent-color, #f1c40f);">
                     [${liberoObj.jersey}] ${liberoObj.name}
                 </p>
             </div>
             <div class="select-group">
-                <label>INする選手 (元の選手)</label>
+                <label>INする選手</label>
                 <p style="font-size: 1.2em; font-weight: bold;">
                     [${originalPlayer.jersey}] ${originalPlayer.name}
                 </p>
             </div>
-            <p style="margin-top:10px; color:#ccc;">リベロをベンチに戻し、元の選手をコートに戻します。</p>
+            <p style="margin-top:10px; color:#666; font-size:0.9em;">リベロをベンチに戻し、元の選手をコートに戻します。</p>
             <input type="hidden" id="libero-action-type" value="OUT">
-            <input type="hidden" id="libero-out-target-id" value="${originalPlayer.id}">
+            <input type="hidden" id="libero-out-target-id" value="${originalId}">
         `;
         uiElements.liberoModalBody.innerHTML = html;
     } else {
+        // --- リベロ IN モード (ここは変更なしですが念のため記載) ---
         uiElements.liberoModalTitle.textContent = 'リベロ交代 (IN)';
-        let mainLibero = testLiberos['L1'];
-        if (!mainLibero) mainLibero = testLiberos['L2'];
-        if (!mainLibero) mainLibero = Object.values(testLiberos)[0];
+        let mainLibero = testLiberos['L1'] || testLiberos['L2'] || Object.values(testLiberos)[0];
+        
         if (!mainLibero) {
-            UIManager.showFeedback("リベロが登録されていません。\n試合設定でリベロを選択してください。");
+            UIManager.showFeedback("リベロが登録されていません。\n試合設定を確認してください。");
             return;
         }
-        const backRowPlayers = getBackRowPlayers(); // 後衛選手リスト
+        const backRowPlayers = getBackRowPlayers(); // 後衛選手リスト取得
         let html = `
             <div class="select-group">
                 <label>INする選手</label>
@@ -3076,7 +3099,7 @@ function handleLiberoTap() {
                 </p>
             </div>
             <div class="select-group">
-                <label for="select-libero-out">OUTする選手 (後衛)</label>
+                <label for="select-libero-out">OUTする選手(後衛)</label>
                 <select id="select-libero-out">
                     ${backRowPlayers.map(p => `<option value="${p.id}">[${p.jersey}] ${p.name}</option>`).join('')}
                 </select>
@@ -3128,44 +3151,40 @@ function closeLiberoModal() {
     uiElements.liberoModal.style.display = 'none';
 }
 function executeLiberoSubstitution() {
-    const actionTypeInput = document.getElementById('libero-action-type');
-    const actionType = actionTypeInput ? actionTypeInput.value : null; // "IN" or "OUT"
-    const swapInId = document.getElementById('libero-swap-in-id'); // 長押し(リベロ同士の交代)用
+    const actionType = document.getElementById('libero-action-type').value;
+    // ケース1: 長押しによるリベロ同士の交代
+    const swapInId = document.getElementById('libero-swap-in-id')?.value;
     if (swapInId) {
-        const newLiberoId = swapInId.value;
-        const oldPair = liberoPairs[0];
-        if (oldPair) {
-            GameManager.updatePlayerStatus(oldPair.liberoId, null); // 旧リベロ -> ベンチ
-            GameManager.updatePlayerStatus(newLiberoId, 'LB');      // 新リベロ -> コート
-            liberoPairs = [{ liberoId: newLiberoId, playerOutId: oldPair.playerOutId }];
-        }
-    } 
-    else if (actionType === 'OUT') {
-        const targetOriginalPlayerId = document.getElementById('libero-out-target-id').value;
-        const pairToRemove = liberoPairs.find(p => p.playerOutId === targetOriginalPlayerId);
-        if (pairToRemove) {
-            GameManager.updatePlayerStatus(pairToRemove.liberoId, null);
-        }
-        liberoPairs = liberoPairs.filter(p => p.playerOutId !== targetOriginalPlayerId);
-        const originalPlayer = testPlayerList[targetOriginalPlayerId];
-        const originalPos = originalPlayer.position || 'OH';
-        GameManager.updatePlayerStatus(targetOriginalPlayerId, originalPos);
-    } 
-    else {
-        const tapInId = document.getElementById('libero-in-id'); 
-        const selectInId = document.getElementById('select-libero-in'); // 長押し時の選択
-        const selectOutId = document.getElementById('select-libero-out');
-        const liberoToIn = tapInId ? tapInId.value : (selectInId ? selectInId.value : null);
-        const playerToOut = selectOutId ? selectOutId.value : null;
-        if (liberoToIn && playerToOut) {
-            liberoPairs = liberoPairs.filter(p => p.playerOutId !== playerToOut);
-            liberoPairs.push({ liberoId: liberoToIn, playerOutId: playerToOut });
-            GameManager.updatePlayerStatus(playerToOut, null); // 元の選手 -> ベンチ
-            GameManager.updatePlayerStatus(liberoToIn, 'LB');  // リベロ -> コート
+        const originalIds = Object.keys(GameManager.liberoMap);
+        if (originalIds.length > 0) {
+            const originalId = originalIds[0];
+            const oldLiberoId = GameManager.liberoMap[originalId];
+            GameManager.updatePlayerStatus(oldLiberoId, null);
+            GameManager.liberoMap[originalId] = swapInId;
+            GameManager.updatePlayerStatus(swapInId, 'LB');
         }
     }
-    updateSpikerUIRotation(currentRotation); // コート表示更新
-    populateInGameDropdowns(); // ★追加: プルダウンの中身を更新
+    // ケース2: リベロ OUT
+    else if (actionType === 'OUT') {
+        const originalId = document.getElementById('libero-out-target-id').value;
+        const liberoId = GameManager.liberoMap[originalId];
+        if (liberoId) {
+            GameManager.executeLiberoSwap(liberoId, originalId, false);
+        }
+    }
+    // ケース3: リベロ IN
+    else {
+        const liberoId = document.getElementById('libero-in-id')?.value 
+                      || document.getElementById('select-libero-in')?.value;
+        const originalId = document.getElementById('select-libero-out')?.value;
+        if (liberoId && originalId) {
+            if (GameManager.liberoMap[originalId]) {
+                UIManager.showFeedback("その選手は既にリベロと交代しています。");
+                return;
+            }
+            GameManager.executeLiberoSwap(liberoId, originalId, true);
+        }
+    }
     closeLiberoModal();
     updateInputDisplay();
 }
@@ -3838,7 +3857,7 @@ async function endMatchWithoutSaving() {
         await db.rallyLog
             .where('match_id').equals(mId)
             .filter(r => r.set_number === sNum)
-            .delete();-
+            .delete();
         await db.setSummary
             .where('[match_id+set_number]')
             .equals([mId, sNum])
