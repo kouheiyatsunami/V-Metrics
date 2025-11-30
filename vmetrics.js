@@ -1,4 +1,4 @@
-// --- アプリ全体の初期化と設定 ---
+1231// --- アプリ全体の初期化と設定 ---
 async function requestWakeLock() {
     try {
         if ('wakeLock' in navigator) {
@@ -5269,3 +5269,4 @@ async function endMatchWithoutSaving() {
     }
 
 }
+
