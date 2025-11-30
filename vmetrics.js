@@ -30,6 +30,8 @@ async function initialize() {
     console.log("V-Metrics Initializing...");
     // 1. UI要素の取得
     cacheUIElements();
+    await initializeMasterData();
+    InputSelectorManager.init();
     // 2. イベントリスナーの設定
     setupEventListeners();
     // 3. 画面スリープ防止の開始
@@ -38,6 +40,13 @@ async function initialize() {
     updateSpikerUIRotation(currentRotation);
     updateInputDisplay();
     updateScoreboardUI();
+    const lastMatch = await db.matchInfo.get(currentMatchId);
+    if (lastMatch) {
+        UIManager.updateCompetitionName(lastMatch.competition_name);
+        if (uiElements.oppTeamNameDisplay) {
+            uiElements.oppTeamNameDisplay.textContent = lastMatch.opponent_name;
+        }
+    }
     console.log("V-Metrics Ready.");
 }
 document.addEventListener('DOMContentLoaded', () => {
@@ -46,7 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // --- データベース定義 (変更なし) ---
 const db = new Dexie('VMetricsDB');
-db.version(1).stores({
+db.version(3).stores({
     playerList: '&player_id, player_name',
     matchInfo: '++match_id, match_date, opponent_name',
     setRoster: '++set_roster_id, [match_id+set_number], player_id',
@@ -62,10 +71,12 @@ db.version(1).stores({
         toss_area,
         toss_distance,
         toss_length,
-        toss_height
+        toss_height,
+        reason
     `,
     setSummary: '[match_id+set_number]',
-    lineupPatterns: '++id, name'
+    lineupPatterns: '++id, name',
+    appConfig: 'key'
 });
 db.open().catch((err) => {
     console.error('データベースのオープンに失敗しました: ', err);
@@ -84,7 +95,8 @@ const GameManager = {
         ourSets: 0,
         opponentSets: 0,
         isOurServing: true,
-        isSliding: false
+        isSliding: false,
+        firstServerOfCurrentSet: null,
     },
     liberoMap: {},
     history: [],
@@ -123,6 +135,7 @@ const GameManager = {
         this.state.isOurServing = isOurServe;
         this.state.ourSets = 0;
         this.state.opponentSets = 0;
+        this.state.firstServerOfCurrentSet = isOurServe ? 'our' : 'opp';
         this.syncGlobals(); // グローバル変数にも反映
     },
     addScore(isOurPoint) {
@@ -337,6 +350,64 @@ const GameManager = {
             console.error("スコア保存失敗", e);
         }
     },
+    isBackRowPlayer(playerId) {
+        if (this.liberoMap[playerId]) return true; // その選手IDの代わりにリベロが出ている
+        const activeLiberos = Object.values(this.liberoMap);
+        if (activeLiberos.includes(playerId)) return true; // その選手自体がリベロ
+        const rosterItem = testRoster.find(r => r.playerId === playerId);
+        if (!rosterItem) return false;
+        const currentRotation = this.state.rotation;
+        let currentVisualPos = (rosterItem.position - currentRotation + 1);
+        if (currentVisualPos <= 0) currentVisualPos += 6;
+        return [1, 6, 5].includes(currentVisualPos);
+    },
+    validateAttackRules(entry) {
+        if (!entry.spiker_id || !entry.attack_type) return true; // 未入力はスルー
+        const isBackRow = this.isBackRowPlayer(entry.spiker_id);
+        const frontAttacks = ['A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'];
+        const frontAreas = ['A', 'B', 'C'];
+        // 条件: 「後衛選手」かつ「前衛攻撃 または トスエリアがA/B/C」
+        if (isBackRow) {
+            const isFrontType = frontAttacks.includes(entry.attack_type);
+            const isFrontArea = frontAreas.includes(entry.toss_area);
+            if (isFrontType || isFrontArea) {
+                if (entry.attack_type !== 'BACK_ATTACK') {
+                    return false; // 違反
+                }
+            }
+        }
+        return true; // OK
+    },
+    async handleManualScore(isOurPoint) {
+        // 1. 理由コードの決定
+        const reasonCode = isOurPoint ? 'OP' : 'EH';
+        // 2. 簡易記録データの作成
+        const record = {
+            match_id: this.state.matchId,
+            set_number: this.state.setNumber,
+            rally_id: this.state.rallyId,
+            rotation_number: this.state.rotation,
+            setter_id: this.state.setterId, // その時のセッターIDは記録
+            spiker_id: null, // 選手は特定しない
+            attack_type: 'MANUAL', // 手動入力マーカー
+            result: isOurPoint ? 'OPP_MISS' : 'FAULT', // 結果分類
+            reason: reasonCode, // ★ここで理由を保存
+
+            pass_position: null,
+            toss_area: null,
+            toss_distance: null,
+            toss_length: null,
+            toss_height: null
+        };
+        try {
+            await db.rallyLog.add(record);
+            console.log(`手動得点記録: ${reasonCode}`);
+            this.addScore(isOurPoint);
+        } catch (e) {
+            console.error("手動記録エラー", e);
+            UIManager.showFeedback("記録に失敗しました");
+        }
+    },
 };
 
 let currentMatchId = GameManager.state.matchId;
@@ -433,6 +504,10 @@ const UIManager = {
         uiElements.btnTwoAttack.classList.toggle('active', currentRallyEntry.attack_type === 'TWO_ATTACK');
     },
     // スコアボードとサーブ権の更新（2つの関数を統合）
+    updateCompetitionName(name) {
+        const el = document.getElementById('scoreboard-competition-name');
+        if (el) el.textContent = name || '';
+    },
     updateScoreboard() {
         // 点数表示
         if (uiElements.ourScoreDisplay) uiElements.ourScoreDisplay.textContent = ourScore;
@@ -476,6 +551,8 @@ const UIManager = {
             uiElements.btnLibero.classList.remove('libero-in');
             uiElements.btnLibero.textContent = 'リベロ IN';
         }
+        const selectedSpikerId = currentRallyEntry.spiker_id;
+        const selectedSetterId = currentRallyEntry.setter_id;
         // グリッド（コート上の6箇所）の描画
         testRoster.forEach(starter => {
             let visualPos = (starter.position - rotation + 1);
@@ -503,6 +580,16 @@ const UIManager = {
                 gridEl.style.borderColor = '';
                 gridEl.style.borderWidth = '';
                 gridEl.style.backgroundColor = ''; 
+                gridEl.classList.remove('libero-active', 'spiker-active', 'setter-active');
+                if (playerInfo.id === selectedSetterId) {
+                    gridEl.classList.add('setter-active');
+                }
+                else if (playerInfo.id === selectedSpikerId) {
+                    gridEl.classList.add('spiker-active');
+                }
+                else if (playerInfo.position === 'LB' || playerInfo.active_position === 'LB') {
+                    gridEl.classList.add('libero-active');
+                }
             }
         });
     }
@@ -541,7 +628,10 @@ const EditManager = {
                     <div class="log-item-content" ontouchstart="EditManager.handleTouchStart(event, this)" ontouchend="EditManager.handleTouchEnd(event, this)">
                         <div>
                             <span style="font-weight:bold; color:#333;">${currentSetNumber}セット - No.${record.rally_id}</span><br>
-                            <span style="font-size:0.9em; color:#666;">[${player.jersey}] ${player.name} : ${actionName}</span>
+                            <span style="font-size:0.9em; color:#666;">
+                                [${player.jersey}] ${player.name} : ${actionName} 
+                                <span style="font-weight:bold; color:var(--navy); margin-left:5px;">[${record.reason || '-'}]</span>
+                            </span>
                         </div>
                         <div style="font-weight:bold; font-size:1.2em;">${this.getResultSymbol(record)}</div>
                     </div>
@@ -876,6 +966,9 @@ const AnalysisManager = {
         this.onSpikerFilterChange();
         if(this.dom.setterPlayerFilter) this.dom.setterPlayerFilter.value = "全員";
         this.onSetterFilterChange();
+        this.renderRotationAnalysis(this.state.totalData);
+        this.renderReasonBreakdown(this.state.totalData);
+        this.renderSetTransitionChart(this.state.allRawData);
         const totalTab = document.querySelector('.sub-tab-btn[data-filter="total"]');
         if(totalTab) totalTab.click();
     },
@@ -917,6 +1010,23 @@ const AnalysisManager = {
         let denominator = fileCount || 1;
         const spikeData = data.filter(row => row.player && row.player !== 'none');
         const metrics = this.calculateMetrics(spikeData);
+        let soOpp = 0, soWin = 0;
+        let brOpp = 0, brWin = 0;
+        data.forEach(row => {
+            const isSideOutChance = (row.pass && row.pass !== 'UNKNOWN') || (row.attack_type === 'SERVE_ACE' && row.result === 'FAULT');
+            let isOurPoint = false;
+            if (['S','B','SA','OP'].includes(row.reason)) isOurPoint = true;
+            else if (row.result === 'KILL' && !['MS','BS','SV','RE','EH','F'].includes(row.reason)) isOurPoint = true;
+            if (isSideOutChance) {
+                soOpp++;
+                if (isOurPoint) soWin++;
+            } else {
+                brOpp++;
+                if (isOurPoint) brWin++;
+            }
+        });
+        metrics.SO_Rate = soOpp > 0 ? (soWin / soOpp) : 0;
+        metrics.BR_Rate = brOpp > 0 ? (brWin / brOpp) : 0;
         metrics.AS = (metrics.TS / denominator);
         metrics.AK = (metrics.TK / denominator);
         metrics.AC = (spikeData.filter(row => row.pass === 'CHANCE').length / denominator);
@@ -931,13 +1041,25 @@ const AnalysisManager = {
         );
         allPlayers.forEach(player => {
             const playerData = data.filter(row => row.player === player);
-            stats[player] = this.calculateMetrics(playerData);
+            const spikeOnly = playerData.filter(r => !['SERVE','SERVE_ACE','SERVE_MISS'].includes(r.attack_type));
+            stats[player] = this.calculateMetrics(spikeOnly);
+            const serveData = playerData.filter(r => ['SERVE','SERVE_ACE','SERVE_MISS'].includes(r.attack_type));
+            const serveTotal = serveData.length;
+            const serveAce = serveData.filter(r => r.attack_type === 'SERVE_ACE').length;
+            const serveMiss = serveData.filter(r => r.attack_type === 'SERVE_MISS').length;
+            const serveEff = serveTotal > 0 ? ((serveAce*100 - serveMiss*25) / serveTotal) : 0;
+            stats[player].serve = {
+                total: serveTotal,
+                ace: serveAce,
+                miss: serveMiss,
+                eff: serveEff
+            };
         });
         return stats;
     },
     calculateSpikerTossStats(data) {
         const stats = {};
-        const allPlayers = new Set(data.filter(row => row.player && row.player !== 'none').map(row => row.player));
+        const allPlayers = new Set(data.filter(row => row.player && row.player !== 'none' && row.player !== 'NONE').map(row => row.player));
         allPlayers.forEach(player => {
             const playerData = data.filter(row => row.player === player);
             stats[player] = {};
@@ -1001,8 +1123,8 @@ const AnalysisManager = {
             case 'S2': setterData = setterData.filter(row => row.pass === 'S2' || row.pass === 'L2' || row.pass === 'O'); break;
         }
         setterData = setterData.filter(row => row.setter && row.setter !== null && ((row.player && row.player !== null) || row.set_distance === 'miss'));
-        const stats = { good: 0, far: 0, near: 0, long: 0, short: 0, high: 0, low: 0, miss: 0, otherTotal: 0, totalTosses: setterData.length, top10Map: new Map() };
-        if (stats.totalTosses === 0) { stats.top10 = []; return stats; }
+        const stats = { good: 0, far: 0, near: 0, long: 0, short: 0, high: 0, low: 0, miss: 0, otherTotal: 0, totalTosses: setterData.length, top5Map: new Map() };
+        if (stats.totalTosses === 0) { stats.top5= []; return stats; }
         setterData.forEach(row => {
             let qualityKey = "";
             if (row.set_distance === 'miss') { qualityKey = "×"; stats.miss++; } 
@@ -1018,9 +1140,9 @@ const AnalysisManager = {
                 if (row.set_height === 'low') { qualities.push("低"); stats.low++; }
                 qualityKey = qualities.join(' × ') || "△";
             }
-            stats.top10Map.set(qualityKey, (stats.top10Map.get(qualityKey) || 0) + 1);
+            stats.top5Map.set(qualityKey, (stats.top5Map.get(qualityKey) || 0) + 1);
         });
-        stats.top10 = Array.from(stats.top10Map.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        stats.top5 = Array.from(stats.top5Map.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10);
         return stats;
     },
     calculatePassStats(data) {
@@ -1122,7 +1244,7 @@ const AnalysisManager = {
     populatePlayerFilter(allPlayersSet) {
         if (!this.dom.playerFilter) return;
         this.dom.playerFilter.innerHTML = '<option value="全員">全員</option>';
-        Array.from(allPlayersSet).sort().forEach(player => {
+        Array.from(allPlayersSet).filter(player => player !== 'NONE').sort().forEach(player => {
             const option = document.createElement('option');
             option.value = player;
             option.textContent = player;
@@ -1152,6 +1274,10 @@ const AnalysisManager = {
         if (d.PE) d.PE.textContent = formatRate(stats.PE);
         if (d.PCA) d.PCA.textContent = formatRate(stats.PCA);
         if (d.PF) d.PF.textContent = formatRate(stats.PF);
+        const elSO = document.getElementById('stat_SO');
+        const elBR = document.getElementById('stat_BR');
+        if (elSO) elSO.textContent = formatRate(stats.SO_Rate);
+        if (elBR) elBR.textContent = formatRate(stats.BR_Rate);
     },
     triggerGraphAnimation(total, win, lose) {
         const bars = document.querySelectorAll('#overall-graphs .bar-fill');
@@ -1217,8 +1343,22 @@ const AnalysisManager = {
         const selectedSet = this.dom.setterSetFilter.value;
         const selectedCut = this.dom.setterCutFilter.value;
         const baseData = (selectedSet === 'win') ? this.state.winData : (selectedSet === 'lose') ? this.state.loseData : this.state.totalData;
-        const stats = this.calculateSetterStats(baseData, selectedPlayer, selectedCut);
+        let setterData = baseData;
+        if (selectedPlayer !== '全員') {
+            setterData = setterData.filter(row => row.setter === selectedPlayer);
+        }
+        if (selectedCut) {
+            switch(selectedCut) {
+                case 'A': setterData = setterData.filter(row => row.pass === 'A'); break;
+                case 'B': setterData = setterData.filter(row => row.pass === 'B'); break;
+                case 'CHANCE': setterData = setterData.filter(row => row.pass === 'CHANCE'); break;
+                case 'AC': setterData = setterData.filter(row => ['A', 'CHANCE'].includes(row.pass)); break;
+                case 'S2': setterData = setterData.filter(row => ['S2', 'L2', 'O', 'C'].includes(row.pass)); break; // Pass C/Bad
+            }
+        }
+        const stats = this.calculateSetterStats(setterData, selectedPlayer, selectedCut); // ※引数注意
         this.renderSetterStats(stats);
+        this.renderSetterDistributionChart(setterData);
     },
     onSpikerTabChange(e) {
         const tabs = document.querySelectorAll('#spiker-analysis .tab-btn');
@@ -1241,38 +1381,55 @@ const AnalysisManager = {
     renderSpikerTable(spikerStats, denominator) {
         if (!this.dom.spikerTableBody) return;
         this.dom.spikerTableBody.innerHTML = '';
+        const serveTable = document.getElementById('tbl-spiker-serve');
+        const serveBody = serveTable ? serveTable.querySelector('tbody') : null;
+        if (serveBody) serveBody.innerHTML = '';
         const sortedPlayers = Object.keys(spikerStats).sort();
         const formatRate = (rate) => isNaN(rate) ? '--.-%' : `${(rate * 100).toFixed(1)}%`;
         sortedPlayers.forEach(player => {
-            const stats = spikerStats[player];
-            const avgSpikes = (stats.TS / denominator).toFixed(1);
+            const s = spikerStats[player];
+            const sv = s.serve;
+            const avgSpikes = (s.TS / denominator).toFixed(1);
             const classes = {
-                PK: this.getStatColorClass('PK', stats.PK),
-                PE: this.getStatColorClass('PE', stats.PE),
-                PK_Effective: this.getStatColorClass('PK_Effective', stats.PK_Effective),
-                PF: this.getStatColorClass('PF', stats.PF),
-                PC: this.getStatColorClass('PC', stats.PC),
-                PA: this.getStatColorClass('PA', stats.PA),
-                PCA: this.getStatColorClass('PCA', stats.PCA),
-                PK_HighOpp: this.getStatColorClass('PK_HighOpp', stats.PK_HighOpp),
-                PB: this.getStatColorClass('PB', stats.PB),
-                P2: this.getStatColorClass('P2', stats.P2),
+                PK: this.getStatColorClass('PK', s.PK),
+                PE: this.getStatColorClass('PE', s.PE),
+                PK_Effective: this.getStatColorClass('PK_Effective', s.PK_Effective),
+                PF: this.getStatColorClass('PF', s.PF),
+                PC: this.getStatColorClass('PC', s.PC),
+                PA: this.getStatColorClass('PA', s.PA),
+                PCA: this.getStatColorClass('PCA', s.PCA),
+                PK_HighOpp: this.getStatColorClass('PK_HighOpp', s.PK_HighOpp),
+                PB: this.getStatColorClass('PB', s.PB),
+                P2: this.getStatColorClass('P2', s.P2),
             };
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td>${player}</td><td>${avgSpikes}</td>
-                <td class="${classes.PK}">${formatRate(stats.PK)}</td>
-                <td class="${classes.PE}">${formatRate(stats.PE)}</td>
-                <td class="${classes.PK_Effective}">${formatRate(stats.PK_Effective)}</td>
-                <td class="${classes.PF}">${formatRate(stats.PF)}</td>
-                <td class="${classes.PC}">${formatRate(stats.PC)}</td>
-                <td class="${classes.PA}">${formatRate(stats.PA)}</td>
-                <td class="${classes.PCA}">${formatRate(stats.PCA)}</td>
-                <td class="${classes.PK_HighOpp}">${formatRate(stats.PK_HighOpp)}</td>
-                <td class="${classes.PB}">${formatRate(stats.PB)}</td>
-                <td class="${classes.P2}">${formatRate(stats.P2)}</td>
+                <td class="${classes.PK}">${formatRate(s.PK)}</td>
+                <td class="${classes.PE}">${formatRate(s.PE)}</td>
+                <td class="${classes.PK_Effective}">${formatRate(s.PK_Effective)}</td>
+                <td class="${classes.PF}">${formatRate(s.PF)}</td>
+                <td class="${classes.PC}">${formatRate(s.PC)}</td>
+                <td class="${classes.PA}">${formatRate(s.PA)}</td>
+                <td class="${classes.PCA}">${formatRate(s.PCA)}</td>
+                <td class="${classes.PK_HighOpp}">${formatRate(s.PK_HighOpp)}</td>
+                <td class="${classes.PB}">${formatRate(s.PB)}</td>
+                <td class="${classes.P2}">${formatRate(s.P2)}</td>
             `;
             this.dom.spikerTableBody.appendChild(row);
+            if (serveBody && sv) {
+                const missRate = sv.total > 0 ? (sv.miss / sv.total) : 0;
+                const rowServe = document.createElement('tr');
+                rowServe.innerHTML = `
+                    <td style="font-weight:bold; min-width:80px;">${player}</td>
+                    <td>${sv.total}</td>
+                    <td style="color:blue; font-weight:bold;">${sv.ace}</td>
+                    <td style="color:red;">${sv.miss}</td>
+                    <td style="font-weight:bold;">${formatRate(sv.eff)}</td>
+                    <td style="color:#666; font-size:0.9em;">${formatRate(missRate)}</td>
+                `;
+                serveBody.appendChild(rowServe);
+            }
         });
     },
     renderSpikerTossTable(spikerStats) {
@@ -1380,7 +1537,6 @@ const AnalysisManager = {
             if(barF) barF.style.width = `${(stats && !isNaN(stats.rate_fault) ? stats.rate_fault * 100 : 0)}%`;
         });
     },
-
     renderSetterStats(stats) {
         const tableContainer = document.getElementById('setter-table-view');
         const list = document.getElementById('setterTop5List');
@@ -1438,11 +1594,11 @@ const AnalysisManager = {
                     </tr>
                 </tbody>
             `;
-            // --- 2. TOP10リスト描画 ---
+            // --- 2. TOP5リスト描画 ---
             if (list) {
                 list.innerHTML = '';
-                if(this.dom.setterTop5Header) this.dom.setterTop5Header.textContent = "トスの質 組み合わせ Top 10";
-                stats.top10.forEach(([key, count], index) => {
+                if(this.dom.setterTop5Header) this.dom.setterTop5Header.textContent = "トスの質 組合せ Top5";
+                stats.top5.forEach(([key, count], index) => {
                     const li = document.createElement('li');
                     li.textContent = `${index + 1}. ${key} (${count}本)`;
                     list.appendChild(li);
@@ -1468,7 +1624,6 @@ const AnalysisManager = {
             const pie2Colors = ["#3498DB", "#2ECC71", "#9B59B6", "#F1C40F", "#E67E22", "#E74C3C"]; 
             this.drawPieChart(chart2, legend2, pie2Data, pie2Labels, pie2Colors);
         }
-
         tableContainer.innerHTML = tableHTML + '</table>';
     },
     drawPieChart(canvasEl, legendEl, data, labels, colors) {
@@ -1505,6 +1660,305 @@ const AnalysisManager = {
             }
         });
     },
+    chartInstances: {},
+    renderSetTransitionChart(rawData) {
+        const ctx = document.getElementById('chart-set-transition');
+        if (!ctx) return;
+        if (this.chartInstances['setTransition']) {
+            this.chartInstances['setTransition'].destroy();
+        }
+        const setNumbers = [...new Set(rawData.map(d => d.set_number))].sort((a,b)=>a-b);
+        const killRates = [];
+        const effRates = [];
+        setNumbers.forEach(setNum => {
+            const setData = rawData.filter(d => d.set_number === setNum);
+            const spikes = setData.filter(d => d.player && d.player !== 'none');
+            const metrics = this.calculateMetrics(spikes); // 既存の計算関数を再利用
+            killRates.push(metrics.PK ? (metrics.PK * 100).toFixed(1) : 0);
+            effRates.push(metrics.PE ? (metrics.PE * 100).toFixed(1) : 0);
+        });
+        this.chartInstances['setTransition'] = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: setNumbers.map(n => `第${n}セット`),
+                datasets: [
+                    {
+                        label: '決定率 (%)',
+                        data: killRates,
+                        borderColor: '#00478c', // V-Metrics Navy
+                        backgroundColor: '#00478c',
+                        borderWidth: 2,
+                        tension: 0.3, // 少し曲線を滑らかに
+                        pointRadius: 4,
+                        pointBackgroundColor: '#fff',
+                        pointBorderWidth: 2
+                    },
+                    {
+                        label: '効果率 (%)',
+                        data: effRates,
+                        borderColor: '#2ECC71', // Green
+                        backgroundColor: '#2ECC71',
+                        borderWidth: 2,
+                        tension: 0.3,
+                        pointRadius: 4,
+                        pointBackgroundColor: '#fff',
+                        pointBorderWidth: 2,
+                        borderDash: [5, 5] // 点線にする
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            usePointStyle: true,
+                            boxWidth: 8
+                        }
+                    },
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false,
+                        backgroundColor: 'rgba(0, 71, 140, 0.9)', // ツールチップも紺色に
+                        titleFont: { size: 14 },
+                        bodyFont: { size: 14 },
+                        padding: 10
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 100, // 100%が上限
+                        grid: {
+                            color: '#eee' // グリッドは薄く
+                        },
+                        ticks: {
+                            callback: function(value) { return value + "%" }
+                        }
+                    },
+                    x: {
+                        grid: {
+                            display: false // 縦のグリッドは消してスッキリさせる
+                        }
+                    }
+                },
+                interaction: {
+                    mode: 'nearest',
+                    axis: 'x',
+                    intersect: false
+                }
+            }
+        });
+    },
+    renderSetterDistributionChart(setterData) {
+        const ctx = document.getElementById('chart-setter-distribution');
+        if (!ctx) return;
+        if (this.chartInstances['setterDist']) {
+            this.chartInstances['setterDist'].destroy();
+        }
+        const distribution = {};
+        let totalTosses = 0;
+        setterData.forEach(row => {
+            if (row.player && row.player !== 'none' && row.player !== 'NONE') {
+                const name = row.player;
+                distribution[name] = (distribution[name] || 0) + 1;
+                totalTosses++;
+            }
+        });
+        if (totalTosses === 0) return;
+        const sortedPlayers = Object.keys(distribution).sort((a, b) => distribution[b] - distribution[a]);
+        const dataValues = sortedPlayers.map(name => distribution[name]);
+        const colors = [
+            '#00478c', // Navy (1位)
+            '#2ECC71', // Green (2位)
+            '#F1C40F', // Yellow (3位)
+            '#E74C3C', // Red
+            '#9B59B6', // Purple
+            '#34495E', // Dark Gray
+            '#95A5A6'  // Light Gray
+        ];
+        this.chartInstances['setterDist'] = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: sortedPlayers,
+                datasets: [{
+                    data: dataValues,
+                    backgroundColor: colors.slice(0, sortedPlayers.length),
+                    borderColor: '#fff',
+                    borderWidth: 2,
+                    hoverOffset: 4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                cutout: '60%', // ドーナツの穴の大きさ
+                plugins: {
+                    legend: {
+                        position: 'right', // 凡例を右側に配置
+                        labels: {
+                            boxWidth: 12,
+                            padding: 15,
+                            font: { size: 12 }
+                        }
+                    },
+                    title: {
+                        display: true,
+                        text: `総トス数: ${totalTosses}本`,
+                        position: 'bottom',
+                        padding: 20,
+                        color: '#666'
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(0, 71, 140, 0.9)',
+                        bodyFont: { size: 14 },
+                        callbacks: {
+                            label: function(context) {
+                                const label = context.label || '';
+                                const value = context.raw || 0;
+                                const percentage = ((value / totalTosses) * 100).toFixed(1) + '%';
+                                return ` ${label}: ${value}本 (${percentage})`;
+                            }
+                        }
+                    }
+                },
+                layout: {
+                    padding: 20
+                }
+            }
+        });
+    },
+    renderRotationAnalysis(data) {
+        const ctx = document.getElementById('chart-rotation-breakdown');
+        if (!ctx) return;
+        if (this.chartInstances['rotAnalysis']) this.chartInstances['rotAnalysis'].destroy();
+        const rotStats = Array(7).fill(0).map(() => ({
+            soTotal: 0, soWin: 0, // サイドアウト機会、成功
+            brTotal: 0, brWin: 0  // ブレイク機会、成功
+        }));
+        data.forEach(row => {
+            const rot = row.rotation_number || 1; // rotation_numberがない場合は1と仮定
+            let isOurPoint = false;
+            if (['S','B','SA','OP'].includes(row.reason)) isOurPoint = true;
+            else if (row.result === 'KILL' && !['MS','BS','SV','RE','EH','F'].includes(row.reason)) isOurPoint = true;
+            const isSideOutOpp = (row.pass && row.pass !== 'UNKNOWN');
+            if (isSideOutOpp) {
+                rotStats[rot].soTotal++;
+                if (isOurPoint) rotStats[rot].soWin++;
+            } else {
+                rotStats[rot].brTotal++;
+                if (isOurPoint) rotStats[rot].brWin++;
+            }
+        });
+        const labels = ['Rot 1', 'Rot 2', 'Rot 3', 'Rot 4', 'Rot 5', 'Rot 6'];
+        const soRates = [];
+        const brRates = [];
+        for (let i = 1; i <= 6; i++) {
+            const s = rotStats[i];
+            soRates.push(s.soTotal ? (s.soWin / s.soTotal * 100).toFixed(1) : 0);
+            brRates.push(s.brTotal ? (s.brWin / s.brTotal * 100).toFixed(1) : 0);
+        }
+        this.chartInstances['rotAnalysis'] = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'サイドアウト率',
+                        data: soRates,
+                        backgroundColor: '#00478c', // Navy
+                        order: 1
+                    },
+                    {
+                        label: 'ブレイク率',
+                        data: brRates,
+                        backgroundColor: '#E67E22', // Orange
+                        order: 2
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: { beginAtZero: true, max: 100, title: {display:true, text:'%'} }
+                },
+                plugins: {
+                    tooltip: {
+                        callbacks: {
+                            label: (ctx) => {
+                                const val = ctx.raw;
+                                const rotIdx = ctx.dataIndex + 1;
+                                const s = rotStats[rotIdx];
+                                const detail = ctx.datasetIndex === 0 
+                                    ? `${s.soWin}/${s.soTotal}` 
+                                    : `${s.brWin}/${s.brTotal}`;
+                                return `${ctx.dataset.label}: ${val}% (${detail})`;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    },
+    // 2. 得失点内訳 (円グラフ2つ)
+    renderReasonBreakdown(data) {
+        this.renderPie(data, 'chart-point-breakdown', true);
+        this.renderPie(data, 'chart-error-breakdown', false);
+    },
+    renderPie(data, canvasId, isPoint) {
+        const ctx = document.getElementById(canvasId);
+        if (!ctx) return;
+        const key = isPoint ? 'piePoint' : 'pieError';
+        if (this.chartInstances[key]) this.chartInstances[key].destroy();
+        const counts = {};
+        let total = 0;
+        const LABELS = {
+            'S': 'スパイク', 'B': 'ブロック', 'SA': 'Sエース', 'OP': '相手ミス',
+            'MS': 'スパイクミス', 'BS': '被ブロック', 'SV': 'サーブミス', 'RE': 'レシーブミス', 'F': '反則', 'EH':'ハンドリング'
+        };
+        data.forEach(row => {
+            const r = row.reason;
+            if (!r) return;
+            let isRowPoint = ['S','B','SA','OP'].includes(r);
+            if (!isPoint) isRowPoint = !isRowPoint;
+            if (isPoint === isRowPoint) {
+                const label = LABELS[r] || r;
+                counts[label] = (counts[label] || 0) + 1;
+                total++;
+            }
+        });
+        if (total === 0) return; // データなし
+        const sortedKeys = Object.keys(counts).sort((a,b) => counts[b] - counts[a]);
+        const values = sortedKeys.map(k => counts[k]);
+        const colorsPoint = ['#00478c', '#2ECC71', '#F1C40F', '#34495E']; // 青・緑・黄
+        const colorsError = ['#E74C3C', '#E67E22', '#95A5A6', '#8E44AD', '#34495E']; // 赤・橙・灰
+        this.chartInstances[key] = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: sortedKeys,
+                datasets: [{
+                    data: values,
+                    backgroundColor: isPoint ? colorsPoint : colorsError,
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { position: 'right', labels: { boxWidth: 12 } },
+                    title: {
+                        display: true,
+                        text: `Total: ${total}点`,
+                        position: 'bottom'
+                    }
+                }
+            }
+        });
+    },
     switchTab(tabName) {
         if (tabName === 'spike') {
             document.querySelector('.tab-btn[data-view="spiker"]').click();
@@ -1512,145 +1966,496 @@ const AnalysisManager = {
         } else if (tabName === 'toss') {
             document.querySelector('.tab-btn[data-view="setter"]').click();
         }
-    }
+    },
+    async toggleSharePopup(show) {
+        if (!document.getElementById('share-popup')) {
+            if (show) {
+                await this.shareMatchSummaryText();
+            }
+            return;
+        }
+    },
+    async shareMatchSummaryText() {
+        const match = await db.matchInfo.get(currentMatchId);
+        const summaries = await db.setSummary.where('match_id').equals(currentMatchId).toArray();
+        summaries.sort((a,b) => a.set_number - b.set_number);
+        const date = match ? match.match_date : '-';
+        const opp = match ? match.opponent_name : '相手チーム';
+        let text = `【試合結果】\n${date} vs ${opp}\n\n`;
+        let ourTotal = 0;
+        let oppTotal = 0;
+        summaries.forEach(s => {
+            text += `第${s.set_number}セット: ${s.our_final_score} - ${s.opponent_final_score} ${s.our_final_score > s.opponent_final_score ? '○' : '●'}\n`;
+            if (s.our_final_score > s.opponent_final_score) ourTotal++;
+            else oppTotal++;
+        });
+        text += `\nセットカウント: ${ourTotal} - ${oppTotal}\n`;
+        text += `\n#VMetrics`;
+        if (navigator.clipboard) {
+            try {
+                await navigator.clipboard.writeText(text);
+                UIManager.showFeedback("試合結果をクリップボードにコピーしました！\nSNSなどに貼り付けられます。");
+            } catch (err) {
+                console.error('コピー失敗', err);
+                alert("結果:\n" + text);
+            }
+        } else {
+            alert("結果:\n" + text);
+        }
+    },
+    // 共有ロジック
+    toggleSharePopup(show) {
+        const overlay = document.getElementById('share-overlay');
+        if (!overlay) return;
+        
+        if (show) {
+            this.initializeSharePopup();
+            overlay.style.display = 'flex';
+        } else {
+            overlay.style.display = 'none';
+        }
+    },
+    initializeSharePopup() {
+        const container = document.getElementById('share-options-container');
+        const btnPng = document.getElementById('btn-share-png');
+        const btnPdf = document.getElementById('btn-share-pdf');
+        if (!container) return;
+        container.className = 'share-option-list';
+        container.innerHTML = '';
+        this.state.selectedShareOptions = []; 
+        const options = [
+            { id: 'overall', title: '全体分析 (Overall)', desc: '勝敗・得失点・ローテ別成績' },
+            { id: 'spiker_atk', title: 'スパイカー成績 (攻撃)', desc: '決定率・効果率・詳細データ' },
+            { id: 'spiker_srv', title: 'スパイカー成績 (サーブ)', desc: 'エース・ミス・効果率' },
+            { id: 'setter_dist', title: 'セッター配球', desc: '配球チャート・詳細データ' }
+        ];
+        options.forEach(opt => {
+            const item = document.createElement('div');
+            item.className = 'share-option-item';
+            item.innerHTML = `
+                <div class="share-option-check"></div>
+                <div class="share-option-text">
+                    <span class="share-option-title">${opt.title}</span>
+                    <span class="share-option-desc">${opt.desc}</span>
+                </div>
+            `;
+            item.onclick = () => {
+                item.classList.toggle('selected');
+                
+                if (item.classList.contains('selected')) {
+                    this.state.selectedShareOptions.push(opt.id);
+                } else {
+                    this.state.selectedShareOptions = this.state.selectedShareOptions.filter(id => id !== opt.id);
+                }
+                const hasSel = this.state.selectedShareOptions.length > 0;
+                btnPng.disabled = !hasSel;
+                btnPdf.disabled = !hasSel;
+                btnPng.style.opacity = hasSel ? 1 : 0.5;
+                btnPdf.style.opacity = hasSel ? 1 : 0.5;
+            };
+            container.appendChild(item);
+        });
+        btnPng.onclick = () => this.handleExportClick('png');
+        btnPdf.onclick = () => this.handleExportClick('pdf');
+        btnPng.disabled = true; btnPng.style.opacity = 0.5;
+        btnPdf.disabled = true; btnPdf.style.opacity = 0.5;
+    },
+    async handleExportClick(format) {
+        const btn = (format === 'png') ? document.getElementById('btn-share-png') : document.getElementById('btn-share-pdf');
+        const originalText = btn.textContent;
+        btn.textContent = "生成中...";
+        btn.disabled = true;
+        try {
+            const wrapper = document.createElement('div');
+            wrapper.style.position = 'fixed';
+            wrapper.style.left = '-9999px';
+            wrapper.style.top = '0';
+            wrapper.style.width = '800px'; // A4幅に近い固定幅
+            wrapper.style.backgroundColor = '#fff';
+            wrapper.style.padding = '40px';
+            wrapper.style.fontFamily = 'sans-serif';
+            document.body.appendChild(wrapper);
+            const match = await db.matchInfo.get(currentMatchId);
+            const title = document.createElement('h1');
+            title.textContent = `V-Metrics Report`;
+            title.style.color = '#00478c';
+            title.style.borderBottom = '2px solid #00478c';
+            wrapper.appendChild(title);
+            const meta = document.createElement('p');
+            meta.innerHTML = `Date: <b>${match?.match_date}</b> | Opponent: <b>${match?.opponent_name}</b>`;
+            wrapper.appendChild(meta);
+            for (const id of this.state.selectedShareOptions) {
+                const section = document.createElement('div');
+                section.style.marginTop = '30px';
+                section.style.pageBreakInside = 'avoid'; // PDF改ページ対策
+                let sourceEl = null;
+                let sectionTitle = "";
+                if (id === 'overall') {
+                    sectionTitle = "全体分析";
+                    sourceEl = document.querySelector('#overall-analysis .overall-container');
+                } else if (id === 'spiker_atk') {
+                    sectionTitle = "スパイカー成績 (攻撃)";
+                    // テーブルだけ取得 (h3タグの次にあるdiv)
+                    const h3 = Array.from(document.querySelectorAll('#spiker-table-view h3')).find(el => el.textContent.includes('攻撃'));
+                    if(h3) sourceEl = h3.nextElementSibling;
+                } else if (id === 'spiker_srv') {
+                    sectionTitle = "スパイカー成績 (サーブ)";
+                    const h3 = Array.from(document.querySelectorAll('#spiker-table-view h3')).find(el => el.textContent.includes('サーブ'));
+                    if(h3) sourceEl = h3.nextElementSibling;
+                } else if (id === 'setter_dist') {
+                    sectionTitle = "セッター配球";
+                    sourceEl = document.querySelector('#setter-analysis .chart-container');
+                }
+                if (sourceEl) {
+                    const h2 = document.createElement('h2');
+                    h2.textContent = sectionTitle;
+                    h2.style.background = '#f0f0f0';
+                    h2.style.padding = '5px 10px';
+                    h2.style.fontSize = '1.2rem';
+                    section.appendChild(h2);
+                    const clone = sourceEl.cloneNode(true);
+                    const originalCanvases = sourceEl.querySelectorAll('canvas');
+                    const clonedCanvases = clone.querySelectorAll('canvas');
+                    originalCanvases.forEach((orig, index) => {
+                        const dest = clonedCanvases[index];
+                        if (dest) {
+                            const img = document.createElement('img');
+                            img.src = orig.toDataURL("image/png");
+                            img.style.width = '100%';
+                            img.style.maxWidth = '100%'; // 幅合わせ
+                            dest.parentNode.replaceChild(img, dest);
+                        }
+                    });
+                    section.appendChild(clone);
+                    wrapper.appendChild(section);
+                }
+            }
+            const canvas = await html2canvas(wrapper, {
+                scale: 2, // 高画質
+                useCORS: true,
+                logging: false
+            });
+            if (format === 'png') {
+                const link = document.createElement('a');
+                link.download = `VMetrics_Report_${Date.now()}.png`;
+                link.href = canvas.toDataURL();
+                link.click();
+            } else {
+                const { jsPDF } = window.jspdf;
+                const pdf = new jsPDF('p', 'mm', 'a4');
+                const imgData = canvas.toDataURL('image/png');
+                const imgWidth = 210; // A4幅(mm)
+                const pageHeight = 295; 
+                const imgHeight = canvas.height * imgWidth / canvas.width;
+                let heightLeft = imgHeight;
+                let position = 0;
+                pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
+                heightLeft -= pageHeight;
+                while (heightLeft >= 0) {
+                    position = heightLeft - imgHeight;
+                    pdf.addPage();
+                    pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
+                    heightLeft -= pageHeight;
+                }
+                pdf.save(`VMetrics_Report_${Date.now()}.pdf`);
+            }
+            document.body.removeChild(wrapper);
+            UIManager.showFeedback("レポートを出力しました");
+        } catch (e) {
+            console.error(e);
+            UIManager.showFeedback("出力に失敗しました");
+        } finally {
+            btn.textContent = originalText;
+            btn.disabled = false;
+        }
+    },
 };
 const TimeoutManager = {
     dom: {},
+    currentLogs: [], // 計算用にデータを保持
+    isSetEndMode: false,
     init() {
         const d = document;
         this.dom = {
             screen: d.getElementById('timeout-screen'),
-            btnClose: d.getElementById('btn-to-close'),
+            mainView: d.getElementById('to-main-view'),
+            detailView: d.getElementById('to-detail-view'),
+            detailTitle: d.getElementById('to-detail-title'),
+            detailContent: d.getElementById('to-detail-content'),
             setNum: d.getElementById('to-set-num'),
             ourScore: d.getElementById('to-our-score'),
             oppScore: d.getElementById('to-opp-score'),
+            btnAction: d.getElementById('btn-to-action'), // 閉じる or 次へ
             killRate: d.getElementById('to-kill-rate'),
             effRate: d.getElementById('to-eff-rate'),
-            barKill: d.getElementById('to-bar-kill'),
-            sideoutRate: d.getElementById('to-sideout-rate'),
-            sideoutCount: d.getElementById('to-sideout-count'),
-            barSideout: d.getElementById('to-bar-sideout'),
-            passGood: d.getElementById('to-pass-good'),
-            passError: d.getElementById('to-pass-error'),
-            barPassA: d.getElementById('to-bar-pass-a'),
-            barPassB: d.getElementById('to-bar-pass-b'),
-            barPassChance: d.getElementById('to-bar-pass-chance'),
-            topScorers: d.getElementById('to-top-scorers'),
-            errSpike: d.getElementById('to-err-spike'),
-            errServe: d.getElementById('to-err-serve'),
-            errRece: d.getElementById('to-err-rece'),
-            errOther: d.getElementById('to-err-other'),
+            barKill: d.getElementById('bar-kill'),
+            soRate: d.getElementById('to-so-rate'),
+            soCount: d.getElementById('to-so-count'),
+            soWinCount: d.getElementById('to-so-win-count'),
+            barSo: d.getElementById('bar-so'),
+            brRate: d.getElementById('to-br-rate'),
+            brCount: d.getElementById('to-br-count'),
+            brWinCount: d.getElementById('to-br-win-count'),
+            barBr: d.getElementById('bar-br'),
+            totalPoints: d.getElementById('to-total-points'),
+            pSpike: d.getElementById('p-spike'),
+            pServe: d.getElementById('p-serve'),
+            pBlock: d.getElementById('p-block'),
+            pOppErr: d.getElementById('p-opp-err'),
+            pSelfRate: d.getElementById('p-self-rate'),
+            totalErrors: d.getElementById('to-total-errors'),
+            eSpike: d.getElementById('e-spike'),
+            eServe: d.getElementById('e-serve'),
+            eRece: d.getElementById('e-rece'),
+            eOther: d.getElementById('e-other'),
+            eOppKill: d.getElementById('e-opp-kill'),
+            topScorers: d.getElementById('to-top-scorers')
         };
-        if (this.dom.btnClose) {
-            this.dom.btnClose.addEventListener('click', () => {
-                this.dom.screen.style.display = 'none';
+        if (this.dom.btnAction) {
+            this.dom.btnAction.addEventListener('click', () => this.handleAction());
+        }
+    },
+    open(isSetEnd = false) {
+        if (!this.dom.screen) this.init(); 
+        this.init(); // 再取得
+        this.isSetEndMode = isSetEnd;
+        if (isSetEnd) {
+            this.dom.btnAction.textContent = "次のセットへ";
+            this.dom.btnAction.classList.add('btn-next-set');
+        } else {
+            this.dom.btnAction.textContent = "閉じる";
+            this.dom.btnAction.classList.remove('btn-next-set');
+        }
+        this.hideDetail(); 
+        this.calculateAndRender();
+        this.dom.screen.style.display = 'flex';
+    },
+    handleAction() {
+        this.dom.screen.style.display = 'none';
+        if (this.isSetEndMode) {
+            setTimeout(() => {
+                const btnNext = document.getElementById('btn-next-set'); // 既存のボタン
+                if(btnNext) btnNext.click(); // 既存のロジックを流用
+            }, 100);
+        }
+    },
+    showDetail(type) {
+        this.dom.mainView.style.display = 'none';
+        this.dom.detailView.style.display = 'flex';
+        
+        if (type === 'attack') {
+            this.dom.detailTitle.textContent = "アタック詳細 (選手別)";
+            this.renderAttackDetail();
+        } else if (type === 'rotation') {
+            this.dom.detailTitle.textContent = "ローテーション別 SO / Break";
+            this.renderRotationDetail();
+        }
+    },
+    hideDetail() {
+        this.dom.detailView.style.display = 'none';
+        this.dom.mainView.style.display = 'grid';
+    },
+    async calculateAndRender() {
+        this.currentLogs = await db.rallyLog
+            .where('match_id').equals(currentMatchId)
+            .filter(r => r.set_number === currentSetNumber)
+            .toArray();
+        const logs = this.currentLogs;
+        let spikes = 0, kills = 0, errors = 0;
+        let soOpp = 0, soWin = 0;
+        let brOpp = 0, brWin = 0;
+        const pts = { S:0, SA:0, B:0, OP:0 }; 
+        const errs = { S:0, SV:0, R:0, O:0 };
+        let oppKillCount = 0;
+        const playerScores = {}; 
+        logs.forEach(row => {
+            if (row.spiker_id) {
+                if (!playerScores[row.spiker_id]) {
+                    playerScores[row.spiker_id] = { total: 0, S: 0, B: 0, SA: 0, kills: 0, spikes: 0 };
+                }
+            }
+            const isSpike = ['SPIKE','LEFT','RIGHT','BACK_ATTACK','A_QUICK','B_QUICK','C_QUICK','A_SEMI'].includes(row.attack_type);
+            if (isSpike && row.spiker_id) {
+                spikes++;
+                playerScores[row.spiker_id].spikes++;
+                if (row.result === 'KILL') {
+                    kills++;
+                    playerScores[row.spiker_id].kills++; // 決定率計算用
+                }
+                if (row.result === 'FAULT' || row.result === 'BLOCKED') errors++;
+            }
+            const isSideOutChance = (row.pass_position && row.pass_position !== 'UNKNOWN') 
+                                 || (row.reason === 'SA' && row.result === 'FAULT');
+            let isOurPoint = false;
+            if (['S','B','SA','OP'].includes(row.reason)) isOurPoint = true;
+            else if (row.result === 'KILL' && !['MS','BS','SV','RE','EH','F'].includes(row.reason)) isOurPoint = true;
+            if (isSideOutChance) {
+                soOpp++;
+                if (isOurPoint) soWin++;
+            } else {
+                brOpp++;
+                if (isOurPoint) brWin++;
+            }
+            if (isOurPoint) {
+                if (['S','B','SA'].includes(row.reason)) {
+                    if(row.reason === 'S') pts.S++;
+                    else if(row.reason === 'SA') pts.SA++;
+                    else if(row.reason === 'B') pts.B++;
+                    if (row.spiker_id) {
+                        if (!playerScores[row.spiker_id]) playerScores[row.spiker_id] = { total: 0, S: 0, B: 0, SA: 0, kills: 0, spikes: 0 };
+                        playerScores[row.spiker_id].total++; // 合計点アップ
+                        if(row.reason === 'S') playerScores[row.spiker_id].S++;
+                        if(row.reason === 'SA') playerScores[row.spiker_id].SA++;
+                        if(row.reason === 'B') playerScores[row.spiker_id].B++;
+                    }
+                } else {
+                    pts.OP++;
+                }
+            } else {
+                if (row.reason === 'MS' || row.reason === 'BS') errs.S++;
+                else if (row.reason === 'SV') errs.SV++;
+                else if (row.reason === 'RE' || row.reason === 'SA') { errs.R++; if(row.reason === 'SA') oppKillCount++; }
+                else if (row.reason === 'S') { oppKillCount++; }
+                else errs.O++;
+            }
+        });
+        // --- 描画 (数値反映) ---
+        this.dom.setNum.textContent = currentSetNumber;
+        this.dom.ourScore.textContent = GameManager.state.ourScore;
+        this.dom.oppScore.textContent = GameManager.state.opponentScore;
+        const kRate = spikes ? (kills / spikes * 100).toFixed(1) : 0;
+        const eRate = spikes ? ((kills - errors) / spikes * 100).toFixed(1) : 0;
+        this.dom.killRate.textContent = `${kRate}%`;
+        this.dom.effRate.textContent = `${eRate}%`;
+        if(this.dom.barKill) this.dom.barKill.style.width = `${Math.min(kRate, 100)}%`;
+        const sRate = soOpp ? (soWin / soOpp * 100).toFixed(1) : 0;
+        this.dom.soRate.textContent = `${sRate}%`;
+        this.dom.soCount.textContent = soOpp;
+        if(this.dom.soWinCount) this.dom.soWinCount.textContent = soWin;
+        if(this.dom.barSo) this.dom.barSo.style.width = `${Math.min(sRate, 100)}%`;
+        const bRate = brOpp ? (brWin / brOpp * 100).toFixed(1) : 0;
+        this.dom.brRate.textContent = `${bRate}%`;
+        this.dom.brCount.textContent = brOpp;
+        if(this.dom.brWinCount) this.dom.brWinCount.textContent = brWin;
+        if(this.dom.barBr) this.dom.barBr.style.width = `${Math.min(bRate, 100)}%`;
+        const totalGet = pts.S + pts.SA + pts.B + pts.OP;
+        const selfGet = pts.S + pts.SA + pts.B;
+        this.dom.totalPoints.textContent = totalGet;
+        this.dom.pSpike.textContent = pts.S;
+        this.dom.pServe.textContent = pts.SA;
+        this.dom.pBlock.textContent = pts.B;
+        this.dom.pOppErr.textContent = pts.OP;
+        this.dom.pSelfRate.textContent = totalGet ? Math.round(selfGet/totalGet*100) + '%' : '0%';
+        const totalLost = errs.S + errs.SV + errs.R + errs.O + oppKillCount; 
+        this.dom.totalErrors.textContent = totalLost;
+        this.dom.eSpike.textContent = errs.S;
+        this.dom.eServe.textContent = errs.SV;
+        this.dom.eRece.textContent = errs.R;
+        this.dom.eOther.textContent = errs.O;
+        this.dom.eOppKill.textContent = oppKillCount;
+        this.dom.topScorers.innerHTML = '';
+        const sortedPlayers = Object.entries(playerScores)
+            .sort((a, b) => b[1].total - a[1].total) // 合計得点順
+            .slice(0, 5);
+        if (sortedPlayers.length === 0) {
+            this.dom.topScorers.innerHTML = '<li style="justify-content:center; color:#555;">データなし</li>';
+        } else {
+            sortedPlayers.forEach(([pid, stats]) => {
+                if (stats.total === 0) return;
+                const p = testPlayerList[pid] || { name: 'Unknown', jersey: '?' };
+                const li = document.createElement('li');
+                const breakdown = [];
+                if(stats.S > 0) breakdown.push(`S:${stats.S}`);
+                if(stats.B > 0) breakdown.push(`B:${stats.B}`);
+                if(stats.SA > 0) breakdown.push(`A:${stats.SA}`);
+                
+                li.innerHTML = `
+                    <span>[${p.jersey}] ${p.name}</span>
+                    <div>
+                        <span class="scorer-val">${stats.total}点</span>
+                        <span style="font-size:0.75rem; color:#888; margin-left:5px;">(${breakdown.join(', ')})</span>
+                    </div>
+                `;
+                this.dom.topScorers.appendChild(li);
             });
         }
     },
-    async open() {
-        if (!this.dom.screen) this.init();
-        try {
-            const logs = await db.rallyLog
-                .where('match_id')
-                .equals(currentMatchId)
-                .filter(record => record.set_number === currentSetNumber)
-                .toArray();
-            const stats = this.calculateQuickStats(logs);
-            this.render(stats);
-            this.dom.screen.style.display = 'flex';
-        } catch (err) {
-            UIManager.showFeedback("データの読み込みに失敗しました。");
-        }
-    },
-    calculateQuickStats(logs) {
-        const s = {
-            scoreOur: ourScore,
-            scoreOpp: opponentScore,
-            setNum: currentSetNumber,
-            spikes: 0, kills: 0, errors: 0,
-            passTotal: 0, passA: 0, passB: 0, passC: 0, passErr: 0,
-            sideoutOpp: 0, sideoutSuccess: 0, // 機会数, 成功数
-            errServe: 0, errRece: 0, errSpike: 0, errOther: 0,
-            playerScores: {} // { pid: { kills:0, total:0 } }
-        };
-        logs.forEach(l => {
-            if (['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'].includes(l.attack_type) || (!l.attack_type && l.spiker_id)) {
-                if (l.spiker_id) {
-                    s.spikes++;
-                    if (!s.playerScores[l.spiker_id]) s.playerScores[l.spiker_id] = { kills: 0, total: 0 };
-                    s.playerScores[l.spiker_id].total++;
-
-                    if (l.result === 'KILL') {
-                        s.kills++;
-                        s.playerScores[l.spiker_id].kills++;
-                    } else if (l.result === 'FAULT' || l.result === 'BLOCKED') {
-                        s.errors++;
-                        s.errSpike++;
-                    }
-                }
+    // --- 詳細レンダリング: アタック ---
+    renderAttackDetail() {
+        const stats = {}; // { pid: { spikes, kills, errors } }
+        this.currentLogs.forEach(row => {
+            const isSpike = ['SPIKE','LEFT','RIGHT','BACK_ATTACK','A_QUICK','B_QUICK','C_QUICK','A_SEMI'].includes(row.attack_type);
+            if (isSpike && row.spiker_id) {
+                if (!stats[row.spiker_id]) stats[row.spiker_id] = { spikes:0, kills:0, errors:0 };
+                stats[row.spiker_id].spikes++;
+                if (row.result === 'KILL') stats[row.spiker_id].kills++;
+                if (row.result === 'FAULT' || row.result === 'BLOCKED') stats[row.spiker_id].errors++;
             }
-            if (['A', 'B', 'CHNACE', 'S2', 'L2', 'O'].includes(l.pass_position)) {
-                s.passTotal++;
-                if (l.pass_position === 'A') s.passA++;
-                else if (l.pass_position === 'B') s.passB++;
-                else if (l.pass_position === 'CHANCE') s.passChance++;
-                else s.passC++; // その他はC扱い
-            }
-            if (l.attack_type === 'SERVE_ACE') { // 被エース＝レシーブミス
-                s.passTotal++;
-                s.passErr++;
-                s.errRece++;
-            }
-            if (l.attack_type === 'SERVE_MISS') s.errServe++;
-            if (l.attack_type === 'FOUL' && l.result === 'FAULT') s.errOther++;
         });
-        s.sideoutOpp = s.passTotal; // レセプション回数 ≒ サイドアウト機会
-        s.sideoutSuccess = s.kills; 
-
-        return s;
-    },
-
-    render(s) {
-        this.dom.setNum.textContent = s.setNum;
-        this.dom.ourScore.textContent = s.scoreOur;
-        this.dom.oppScore.textContent = s.scoreOpp;
-        const kRate = s.spikes ? (s.kills / s.spikes * 100).toFixed(1) : 0.0;
-        const eRate = s.spikes ? ((s.kills - s.errors) / s.spikes * 100).toFixed(1) : 0.0;
-        this.dom.killRate.textContent = `${kRate}%`;
-        this.dom.effRate.textContent = `${eRate}%`;
-        this.dom.barKill.style.width = `${kRate}%`;
-        const soRate = s.sideoutOpp ? (s.kills / s.sideoutOpp * 100).toFixed(1) : 0.0; // ※仮ロジック
-        this.dom.sideoutRate.textContent = `${soRate}%`;
-        this.dom.sideoutCount.textContent = `決定: ${s.kills} / 受数: ${s.sideoutOpp}`;
-        this.dom.barSideout.style.width = `${Math.min(soRate, 100)}%`;
-        const pA = s.passTotal ? (s.passA / s.passTotal * 100) : 0;
-        const pB = s.passTotal ? (s.passB / s.passTotal * 100) : 0;
-        const pChance = s.passTotal ? (s.passC / s.passTotal * 100) : 0;
-        const goodRate = s.passTotal ? ((s.passA + s.passB) / s.passTotal * 100).toFixed(1) : 0.0;
-        this.dom.passGood.textContent = `${goodRate}%`;
-        this.dom.passError.textContent = s.passErr;
-        this.dom.barPassA.style.width = `${pA}%`;
-        this.dom.barPassB.style.width = `${pB}%`;
-        this.dom.barPassChance.style.width = `${pChance}%`;
-        const sortedPlayers = Object.entries(s.playerScores)
-            .sort((a, b) => b[1].kills - a[1].kills)
-            .slice(0, 3); // Top 3
-        this.dom.topScorers.innerHTML = '';
-        sortedPlayers.forEach(([pid, val]) => {
+        const sorted = Object.entries(stats).sort((a,b) => b[1].spikes - a[1].spikes);
+        let html = `
+            <table class="dark-table">
+                <thead><tr><th>選手</th><th>打数</th><th>得点</th><th>失点</th><th>決定率</th><th>効果率</th></tr></thead>
+                <tbody>
+        `;
+        sorted.forEach(([pid, s]) => {
             const p = testPlayerList[pid] || { name: 'Unknown', jersey: '?' };
-            const rate = val.total ? (val.kills / val.total * 100).toFixed(0) : 0;
-            
-            const li = document.createElement('li');
-            li.innerHTML = `
-                <span>[${p.jersey}] ${p.name}</span>
-                <span class="to-val">${val.kills}本 (${rate}%)</span>
-            `;
-            this.dom.topScorers.appendChild(li);
+            const kRate = (s.kills / s.spikes * 100).toFixed(1);
+            const eRate = ((s.kills - s.errors) / s.spikes * 100).toFixed(1);
+            html += `<tr>
+                <td style="font-weight:bold; color:#f39c12;">[${p.jersey}] ${p.name}</td>
+                <td>${s.spikes}</td>
+                <td style="color:#2ECC71;">${s.kills}</td>
+                <td style="color:#E74C3C;">${s.errors}</td>
+                <td style="font-weight:bold;">${kRate}%</td>
+                <td style="color:#aaa;">${eRate}%</td>
+            </tr>`;
         });
-        this.dom.errSpike.textContent = s.errSpike;
-        this.dom.errServe.textContent = s.errServe;
-        this.dom.errRece.textContent = s.errRece;
-        this.dom.errOther.textContent = s.errOther;
+        html += '</tbody></table>';
+        this.dom.detailContent.innerHTML = html;
+    },
+    // --- 詳細レンダリング: ローテーション ---
+    renderRotationDetail() {
+        const rotStats = {};
+        for(let i=1; i<=6; i++) rotStats[i] = { soTotal:0, soWin:0, brTotal:0, brWin:0 };
+        this.currentLogs.forEach(row => {
+            const rot = row.rotation_number || 1;
+            if(!rotStats[rot]) rotStats[rot] = { soTotal:0, soWin:0, brTotal:0, brWin:0 }; // 安全策
+
+            const isSideOutChance = (row.pass_position && row.pass_position !== 'UNKNOWN') || (row.reason === 'SA' && row.result === 'FAULT');
+            let isOurPoint = false;
+            if (['S','B','SA','OP'].includes(row.reason)) isOurPoint = true;
+            else if (row.result === 'KILL' && !['MS','BS','SV','RE','EH','F'].includes(row.reason)) isOurPoint = true;
+
+            if (isSideOutChance) {
+                rotStats[rot].soTotal++;
+                if (isOurPoint) rotStats[rot].soWin++;
+            } else {
+                rotStats[rot].brTotal++;
+                if (isOurPoint) rotStats[rot].brWin++;
+            }
+        });
+        let html = `
+            <table class="dark-table">
+                <thead><tr><th>Rot</th><th>S.O.率</th><th>成功/機会</th><th>Break率</th><th>成功/機会</th></tr></thead>
+                <tbody>
+        `;
+        for(let i=1; i<=6; i++) {
+            const s = rotStats[i];
+            const soRate = s.soTotal ? (s.soWin / s.soTotal * 100).toFixed(0) : '-';
+            const brRate = s.brTotal ? (s.brWin / s.brTotal * 100).toFixed(0) : '-';
+            const soColor = (s.soTotal && (s.soWin/s.soTotal < 0.3)) ? '#E74C3C' : '#2ECC71';
+
+            html += `<tr>
+                <td style="font-weight:bold; color:#fff;">Rot ${i}</td>
+                <td style="font-weight:bold; color:${soColor}; font-size:1.1em;">${soRate}%</td>
+                <td style="color:#888;">${s.soWin} / ${s.soTotal}</td>
+                <td style="font-weight:bold; color:#E67E22; font-size:1.1em;">${brRate}%</td>
+                <td style="color:#888;">${s.brWin} / ${s.brTotal}</td>
+            </tr>`;
+        }
+        html += '</tbody></table>';
+        this.dom.detailContent.innerHTML = html;
     }
 };
 const DataManager = {
@@ -1982,7 +2787,527 @@ const DataManager = {
             UIManager.showFeedback("削除処理中にエラーが発生しました");
         }
     },
+    async exportBackupJSON() {
+        try {
+            const data = {
+                version: 1,
+                timestamp: new Date().toISOString(),
+                playerList: await db.playerList.toArray(),
+                matchInfo: await db.matchInfo.toArray(),
+                setRoster: await db.setRoster.toArray(),
+                rallyLog: await db.rallyLog.toArray(),
+                setSummary: await db.setSummary.toArray(),
+                lineupPatterns: await db.lineupPatterns.toArray()
+            };
+            const jsonStr = JSON.stringify(data, null, 2);
+            const blob = new Blob([jsonStr], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+            link.href = url;
+            link.download = `VMetrics_Backup_${dateStr}.json`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            UIManager.showFeedback("バックアップファイルを保存しました。");
+        } catch (e) {
+            console.error(e);
+            UIManager.showFeedback("バックアップ作成に失敗しました。");
+        }
+    },
+    async importBackupJSON(file) {
+        if (!confirm("【警告】\nバックアップを復元すると、現在のデータは全て削除され、上書きされます。\nよろしいですか？")) return;
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const data = JSON.parse(e.target.result);
+                if (!data.version || !data.playerList) {
+                    throw new Error("不正なファイル形式です");
+                }
+                await db.transaction('rw', db.playerList, db.matchInfo, db.setRoster, db.rallyLog, db.setSummary, db.lineupPatterns, async () => {
+                    await db.playerList.clear();
+                    await db.matchInfo.clear();
+                    await db.setRoster.clear();
+                    await db.rallyLog.clear();
+                    await db.setSummary.clear();
+                    await db.lineupPatterns.clear();
+                    await db.playerList.bulkAdd(data.playerList);
+                    await db.matchInfo.bulkAdd(data.matchInfo);
+                    await db.setRoster.bulkAdd(data.setRoster);
+                    await db.rallyLog.bulkAdd(data.rallyLog);
+                    await db.setSummary.bulkAdd(data.setSummary);
+                    if (data.lineupPatterns) await db.lineupPatterns.bulkAdd(data.lineupPatterns);
+                });
+                UIManager.showFeedback("復元が完了しました。アプリをリロードします。");
+                setTimeout(() => window.location.reload(), 2000);
+            } catch (err) {
+                console.error(err);
+                UIManager.showFeedback("復元に失敗しました: " + err.message);
+            }
+        };
+        reader.readAsText(file);
+    }
 };
+
+async function initializeMasterData() {
+    try {
+        const oppData = await db.appConfig.get('master_opponents');
+        if (!oppData) {
+            await db.appConfig.put({ key: 'master_opponents', data: INITIAL_OPPONENT_DATA });
+            console.log("対戦校マスターデータを初期化しました");
+        }
+        const compData = await db.appConfig.get('master_competitions');
+        if (!compData) {
+            await db.appConfig.put({ key: 'master_competitions', data: INITIAL_COMPETITION_DATA });
+            console.log("大会マスターデータを初期化しました");
+        }
+    } catch (e) {
+        console.error("マスターデータ初期化エラー", e);
+    }
+}
+const TARGET_LEAGUE_FOLDERS = ['関東医歯薬'];
+const InputSelectorManager = {
+    dom: {},
+    targetInput: null,
+    currentKey: null, 
+    currentData: null, 
+    currentPath: [],   
+    isEditMode: false, 
+    init() {
+        this.dom = {
+            modal: document.getElementById('selection-modal'),
+            title: document.getElementById('selection-title'),
+            container: document.getElementById('selection-list-container'),
+            btnClose: document.getElementById('btn-selection-close'),
+            btnBack: document.getElementById('btn-selection-back'),
+            header: document.querySelector('.selection-modal-header')
+        };
+        if (!document.getElementById('btn-selection-edit')) {
+            const editBtn = document.createElement('button');
+            editBtn.id = 'btn-selection-edit';
+            editBtn.className = 'selection-nav-btn';
+            editBtn.textContent = '編集';
+            editBtn.style.marginRight = '10px';
+            editBtn.onclick = () => this.toggleEditMode();
+            this.dom.btnClose.parentNode.insertBefore(editBtn, this.dom.btnClose);
+            this.dom.btnEdit = editBtn;
+        }
+        if (this.dom.btnClose) this.dom.btnClose.addEventListener('click', () => this.close());
+        if (this.dom.btnBack) this.dom.btnBack.addEventListener('click', () => this.goBack());
+        if (uiElements.setupCompetition) {
+            uiElements.setupCompetition.addEventListener('click', () => this.open('master_competitions', uiElements.setupCompetition));
+        }
+        if (uiElements.setupOpponent) {
+            uiElements.setupOpponent.addEventListener('click', () => this.open('master_opponents', uiElements.setupOpponent));
+        }
+    },
+    async openForEdit(key) {
+        await this.open(key, null);
+        this.isEditMode = true;
+        this.updateEditButton();
+        this.render();
+    },
+    async open(key, inputElement) {
+        this.targetInput = inputElement;
+        this.currentKey = key;
+        this.currentPath = []; 
+        this.isEditMode = false;
+        this.movingData = null;
+        this.updateEditButton();
+        
+        const record = await db.appConfig.get(key);
+        this.currentData = record ? record.data : { name: 'root', children: [] };
+
+        this.dom.modal.style.display = 'flex';
+        this.render();
+    },
+    close() {
+        this.dom.modal.style.display = 'none';
+        this.movingData = null;
+    },
+    async saveData() {
+        await db.appConfig.put({ key: this.currentKey, data: this.currentData });
+    },
+    getCurrentNode() {
+        return this.getNodeByPath(this.currentPath);
+    },
+    getParentNode() {
+        if (this.currentPath.length === 0) return null;
+        const parentPath = this.currentPath.slice(0, -1);
+        return this.getNodeByPath(parentPath);
+    },
+    getNodeByPath(path) {
+        let node = this.currentData;
+        for (const index of path) {
+            if (node && node.children) {
+                node = node.children[index];
+            }
+        }
+        return node;
+    },
+    goBack() {
+        if (this.currentPath.length > 0) {
+            this.currentPath.pop();
+            this.render();
+        }
+    },
+    toggleEditMode() {
+        this.isEditMode = !this.isEditMode;
+        this.movingData = null;
+        this.updateEditButton();
+        this.render();
+    },
+    updateEditButton() {
+        if(this.dom.btnEdit) {
+            this.dom.btnEdit.textContent = this.isEditMode ? '完了' : '編集';
+            this.dom.btnEdit.style.backgroundColor = this.isEditMode ? 'var(--orange)' : '';
+        }
+    },
+    async moveLeagueItem(itemIndex, direction) {
+        const parentNode = this.getParentNode();
+        const currentFolderIndex = this.currentPath[this.currentPath.length - 1];
+        const targetFolderIndex = currentFolderIndex + direction;
+        if (!parentNode.children[targetFolderIndex]) return;
+        const currentFolder = this.getCurrentNode();
+        const targetFolder = parentNode.children[targetFolderIndex];
+        const [item] = currentFolder.children.splice(itemIndex, 1);
+        if (!targetFolder.children) targetFolder.children = [];
+        targetFolder.children.push(item);
+        await this.saveData();   
+        const actionName = direction === -1 ? "昇格" : "降格";
+        UIManager.showFeedback(`「${targetFolder.name}」へ${actionName}しました`);
+        this.render();
+    },
+    async render() {
+        const container = this.dom.container;
+        container.innerHTML = '';
+        const currentNode = this.getCurrentNode();
+        const parentNode = this.getParentNode();
+        const isLeagueContext = parentNode && TARGET_LEAGUE_FOLDERS.includes(parentNode.name);
+        const currentFolderIndex = this.currentPath.length > 0 ? this.currentPath[this.currentPath.length - 1] : -1;
+        if (this.currentPath.length === 0) {
+            this.dom.title.textContent = (this.currentKey === 'master_competitions') ? '大会名マスター' : '対戦校マスター';
+            this.dom.btnBack.classList.add('hidden-btn');
+            if (!this.isEditMode && this.targetInput) await this.renderHistory(container);
+        } else {
+            this.dom.title.textContent = currentNode.name;
+            this.dom.btnBack.classList.remove('hidden-btn');
+        }
+        if (this.isEditMode && this.movingData) {
+            const moveBanner = document.createElement('div');
+            moveBanner.className = 'move-banner';
+            moveBanner.innerHTML = `
+                <div style="margin-bottom:8px;"><strong>「${this.movingData.name}」</strong>を移動中...</div>
+                <div style="display:flex; gap:10px; justify-content:center;">
+                    <button class="action-btn" style="background:var(--navy); flex:1;" onclick="InputSelectorManager.executeMove()">ここに移動</button>
+                    <button class="action-btn" style="background:#999; width:80px;" onclick="InputSelectorManager.cancelMove()">中止</button>
+                </div>
+            `;
+            container.appendChild(moveBanner);
+        }
+        else if (this.isEditMode) {
+            const addArea = document.createElement('div');
+            addArea.style.padding = '10px';
+            addArea.style.textAlign = 'center';
+            addArea.innerHTML = `
+                <button class="action-btn mini" onclick="InputSelectorManager.addItem(true)">+ フォルダ</button>
+                <button class="action-btn mini" onclick="InputSelectorManager.addItem(false)">+ 項目</button>
+            `;
+            container.appendChild(addArea);
+        }
+        if (currentNode.children && currentNode.children.length > 0) {
+            currentNode.children.forEach((child, index) => {
+                const div = document.createElement('div');
+                div.className = 'selection-item';
+                if (child.type === 'folder') div.classList.add('is-category');
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = child.name;
+                nameSpan.style.flex = "1"; // 名前部分を伸縮させる
+                div.appendChild(nameSpan);
+                if (this.isEditMode) {
+                    const actions = document.createElement('div');
+                    actions.className = 'item-actions'; // 右寄せCSS用クラス
+                    if (isLeagueContext && child.type === 'item') {
+                        const promoteBtn = document.createElement('button');
+                        promoteBtn.textContent = '昇格';
+                        promoteBtn.className = 'league-btn btn-promote';
+                        if (currentFolderIndex === 0) promoteBtn.disabled = true;
+                        promoteBtn.onclick = (e) => { e.stopPropagation(); this.moveLeagueItem(index, -1); };
+                        actions.appendChild(promoteBtn);
+                        const demoteBtn = document.createElement('button');
+                        demoteBtn.textContent = '降格';
+                        demoteBtn.className = 'league-btn btn-demote';
+                        if (currentFolderIndex >= parentNode.children.length - 1) demoteBtn.disabled = true;
+                        demoteBtn.onclick = (e) => { e.stopPropagation(); this.moveLeagueItem(index, 1); };
+                        actions.appendChild(demoteBtn);
+                    } 
+                    const delBtn = document.createElement('button');
+                    delBtn.textContent = '×';
+                    delBtn.className = 'btn-delete';
+                    delBtn.onclick = (e) => { e.stopPropagation(); this.deleteItem(index); };
+                    actions.appendChild(delBtn);
+                    div.appendChild(actions);
+                    div.onclick = () => {
+                        if (child.type === 'folder') {
+                            this.currentPath.push(index);
+                            this.render();
+                        } else if (!this.movingData) {
+                            const newName = prompt('名称を変更:', child.name);
+                            if(newName && newName.trim()) {
+                                child.name = newName;
+                                this.saveData();
+                                this.render();
+                            }
+                        }
+                    };
+                } else {
+                    div.onclick = () => {
+                        if (child.type === 'folder') {
+                            this.currentPath.push(index);
+                            this.render();
+                        } else {
+                            this.selectItem(child.name);
+                        }
+                    };
+                }
+                container.appendChild(div);
+            });
+        } else {
+            if (!this.isEditMode && !this.movingData) {
+                const empty = document.createElement('div');
+                empty.style.padding='20px'; empty.style.textAlign='center'; empty.style.color='#999';
+                empty.textContent='項目がありません';
+                container.appendChild(empty);
+            }
+        }
+    },
+    async renderHistory(container) {
+        try {
+            const fieldName = (this.currentKey === 'master_competitions') ? 'competition_name' : 'opponent_name';
+            const allMatches = await db.matchInfo.orderBy('match_date').reverse().toArray();
+            const historySet = new Set();
+            const historyList = [];
+            allMatches.forEach(m => {
+                if (m[fieldName] && !historySet.has(m[fieldName])) {
+                    historySet.add(m[fieldName]);
+                    historyList.push(m[fieldName]);
+                }
+            });
+            if (historyList.length > 0) {
+                const header = document.createElement('div');
+                header.className = 'history-header';
+                header.textContent = '最近の履歴';
+                container.appendChild(header);
+                historyList.slice(0, 3).forEach(item => {
+                    const div = document.createElement('div');
+                    div.className = 'selection-item';
+                    div.innerHTML = `<span>${item}</span><span class="history-badge">履歴</span>`;
+                    div.onclick = () => this.selectItem(item);
+                    container.appendChild(div);
+                });
+                const sep = document.createElement('div');
+                sep.className = 'history-header';
+                sep.textContent = 'リストから選択';
+                container.appendChild(sep);
+            }
+        } catch(e) { console.error(e); }
+    },
+    async addItem(isFolder) {
+        const typeName = isFolder ? 'フォルダ' : '項目';
+        const name = prompt(`新しい${typeName}の名前を入力:`);
+        if (!name || !name.trim()) return;
+        const currentNode = this.getCurrentNode();
+        if (!currentNode.children) currentNode.children = [];
+        currentNode.children.push({
+            name: name.trim(),
+            type: isFolder ? 'folder' : 'item',
+            children: isFolder ? [] : undefined
+        });
+        await this.saveData();
+        this.render();
+    },
+    async deleteItem(index) {
+        if (!confirm('本当に削除しますか？')) return;
+        const currentNode = this.getCurrentNode();
+        currentNode.children.splice(index, 1);
+        await this.saveData();
+        this.render();
+    },
+    selectItem(value) {
+        if (this.targetInput) {
+            this.targetInput.value = value;
+            if (this.currentKey === 'master_competitions') {
+                let currentFolder = this.getCurrentNode();
+                let folderName = currentFolder ? currentFolder.name : '';
+                const pathNames = [];
+                let node = this.currentData;
+                pathNames.push(node.name);
+                for (const index of this.currentPath) {
+                    if (node && node.children) {
+                        node = node.children[index];
+                        pathNames.push(node.name);
+                    }
+                }
+                const matchTypeSelect = document.getElementById('setup-match-type');
+                if (matchTypeSelect) {
+                    const fullPath = pathNames.join('/');
+                    if (fullPath.includes("公式")) {
+                        matchTypeSelect.value = "official";
+                        console.log("Auto-select: Official");
+                    } else if (fullPath.includes("練習")) {
+                        matchTypeSelect.value = "practice";
+                        console.log("Auto-select: Practice");
+                    } else if (fullPath.includes("参考")) {
+                        matchTypeSelect.value = "reference"; // 参考試合も練習扱いで良い場合
+                    }
+                }
+            }
+        }
+        this.close();
+    }
+};
+window.InputSelectorManager = InputSelectorManager;
+
+const ReasonInputManager = {
+    REASONS: {
+        GAIN: {
+            self: [
+                { code: 'SA', label: 'サービスエース', action: 'SERVE_ACE' },
+                { code: 'B',  label: 'ブロック', action: 'BLOCK' }
+            ],
+            opp: [
+                { code: 'SE', label: 'サーブミス', action: 'OPPONENT_MISS' },
+                { code: 'MS', label: 'スパイクミス', action: 'OPPONENT_MISS' },
+                { code: 'MB', label: 'ブロックミス', action: 'OPPONENT_MISS' }, // 吸い込み等
+                { code: 'MR', label: 'レシーブミス', action: 'OPPONENT_MISS' },
+                { code: 'M',  label: '返球ミス',   action: 'OPPONENT_MISS' },
+                { code: 'F',  label: '反則',       action: 'OPPONENT_MISS' }
+            ]
+        },
+        LOSS: {
+            opp: [
+                { code: 'SA', label: '被エース',   action: 'SERVE_ACE' }, // 相手のSA
+                { code: 'S',  label: '被スパイク', action: 'SPIKE' }      // 相手のスパイク決定
+            ],
+            self: [
+                { code: 'SE', label: 'サーブミス', action: 'SERVE_MISS' },
+                { code: 'MB', label: 'ブロックミス', action: 'BLOCK' }, // 吸い込み等(Touch Out)
+                { code: 'MR', label: 'レシーブミス', action: 'PASS' },  // お見合い等
+                { code: 'M',  label: '返球ミス',   action: 'DIG' },
+                { code: 'F',  label: '反則',       action: 'FOUL' }
+            ]
+        }
+    },
+    targetSide: null, // 'our' (得点) or 'opp' (失点)
+    open(side) {
+        this.targetSide = side;
+        const modal = document.getElementById('reason-modal');
+        const container = document.getElementById('reason-buttons-container');
+        const title = document.getElementById('reason-modal-title');
+        container.innerHTML = ''; // クリア
+        if (side === 'our') {
+            title.textContent = "自チーム得点：理由を選択";
+            this.renderGroup(container, "自チームの得点", this.REASONS.GAIN.self, "reason-good");
+            this.renderGroup(container, "相手チームのミス", this.REASONS.GAIN.opp, "reason-neutral");
+        } else {
+            title.textContent = "相手チーム得点：理由を選択";
+            this.renderGroup(container, "相手チームの得点", this.REASONS.LOSS.opp, "reason-neutral"); // 相手のナイスプレーはニュートラル色か赤系
+            this.renderGroup(container, "自チームのミス", this.REASONS.LOSS.self, "reason-bad");
+        }
+        modal.style.display = 'flex';
+    },
+    renderGroup(container, labelText, items, btnClass) {
+        const group = document.createElement('div');
+        group.className = 'reason-group';
+        const label = document.createElement('div');
+        label.className = 'reason-group-label';
+        label.textContent = labelText;
+        group.appendChild(label);
+        const row = document.createElement('div');
+        row.className = 'reason-btn-row';
+        items.forEach(item => {
+            const btn = document.createElement('button');
+            btn.className = `reason-btn ${btnClass}`;
+            btn.textContent = `${item.label} (${item.code})`;
+            btn.onclick = () => this.handleSelection(item);
+            row.appendChild(btn);
+        });
+        group.appendChild(row);
+        container.appendChild(group);
+    },
+    close() {
+        document.getElementById('reason-modal').style.display = 'none';
+    },
+    handleSelection(item) {
+        if (item.code === 'B' && this.targetSide === 'our') {
+            this.showFrontRowSelector(item);
+        } else {
+            this.saveLog(item, null); // 通常保存
+        }
+    },
+    showFrontRowSelector(item) {
+        const container = document.getElementById('reason-buttons-container');
+        const title = document.getElementById('reason-modal-title');
+        title.textContent = "ブロックした選手を選択";
+        container.innerHTML = ''; // クリア
+        const frontRowPlayers = [];
+        testRoster.forEach(starter => {
+            let visualPos = (starter.position - currentRotation + 1);
+            if (visualPos <= 0) visualPos += 6;
+            if ([4, 3, 2].includes(visualPos)) {
+                const displayId = GameManager.liberoMap[starter.playerId] || starter.playerId;
+                const player = testPlayerList[displayId];
+                if (player) {
+                    frontRowPlayers.push({ ...player, visualPos });
+                }
+            }
+        });
+        frontRowPlayers.sort((a, b) => b.visualPos - a.visualPos);
+        const row = document.createElement('div');
+        row.className = 'reason-btn-row';
+        row.style.marginTop = '20px';
+        frontRowPlayers.forEach(p => {
+            const btn = document.createElement('button');
+            btn.className = 'reason-btn reason-good';
+            btn.style.padding = '20px';
+            btn.innerHTML = `<span style="display:block; font-size:1.2em;">${p.jersey}</span>${p.name}`;
+            btn.onclick = () => this.saveLog(item, p.id); // 選手ID付きで保存
+            row.appendChild(btn);
+        });
+        const unknownBtn = document.createElement('button');
+        unknownBtn.className = 'reason-btn reason-neutral';
+        unknownBtn.textContent = '不明 / チーム';
+        unknownBtn.onclick = () => this.saveLog(item, null);
+        row.appendChild(unknownBtn);
+        container.appendChild(row);
+    },
+    async saveLog(item, playerId) {
+        const isOurPoint = (this.targetSide === 'our');
+        GameManager.addScore(isOurPoint);
+        const logData = {
+            match_id: currentMatchId,
+            set_number: currentSetNumber,
+            rally_id: currentRallyId,
+            rotation_number: currentRotation,
+            setter_id: null,
+            spiker_id: playerId, // ★選択された選手IDが入る
+            attack_type: item.action,
+            result: isOurPoint ? 'KILL' : 'FAULT',
+            reason: item.code,
+            pass_position: null,
+            toss_area: null
+        };
+        try {
+            await db.rallyLog.add(logData);
+            console.log(`理由付き記録: ${item.code}, Player: ${playerId || 'None'}`);
+        } catch (e) {
+            console.error("ログ保存失敗", e);
+        }
+        this.close();
+        resetCurrentEntry();
+    }
+};
+window.ReasonInputManager = ReasonInputManager;
 
 // DOMが読み込まれたら実行
 document.addEventListener('DOMContentLoaded', () => {
@@ -2155,7 +3480,7 @@ function setupEventListeners() {
     if (uiElements.btnTimeout) {
         uiElements.btnTimeout.addEventListener('click', () => {
             if (typeof TimeoutManager !== 'undefined') {
-                TimeoutManager.open();
+                TimeoutManager.open(false);
             } else {
                 console.error("TimeoutManager is not defined");
             }
@@ -2283,6 +3608,25 @@ function setupNavigationEvents() {
             DataManager.deleteMatchesOnly();
         });
     }
+    if (document.getElementById('btn-backup-json')) {
+        document.getElementById('btn-backup-json').addEventListener('click', () => {
+            DataManager.exportBackupJSON();
+        });
+    }
+    if (document.getElementById('btn-restore-json')) {
+        document.getElementById('btn-restore-json').addEventListener('click', () => {
+            document.getElementById('json-file-input').click();
+        });
+    }
+    if (document.getElementById('json-file-input')) {
+        document.getElementById('json-file-input').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                DataManager.importBackupJSON(file);
+            }
+            e.target.value = ''; // リセット
+        });
+    }
 }
 /** B. 試合設定（スタメン・ベンチ）関連 */
 function setupMatchSetupEvents() {
@@ -2408,7 +3752,7 @@ function setupInputEvents() {
 function setupScoreboardEvents() {
     // 自チーム + 
     uiElements.btnSelfPlus.addEventListener('click', () => {
-        GameManager.addScore(true);
+        ReasonInputManager.open('our');
     });
     // 自チーム - (訂正用)
     uiElements.btnSelfMinus.addEventListener('click', () => {
@@ -2416,7 +3760,7 @@ function setupScoreboardEvents() {
     });
     // 相手チーム +
     uiElements.btnOppPlus.addEventListener('click', () => {
-        GameManager.addScore(false);
+        ReasonInputManager.open('opp');
     });
     // 相手チーム - (訂正用)
     uiElements.btnOppMinus.addEventListener('click', () => {
@@ -2461,7 +3805,7 @@ function setupSetcountEvents() {
     if (uiElements.btnGotoAnalysis) {
         uiElements.btnGotoAnalysis.addEventListener('click', () => {
             uiElements.setEndModal.style.display = 'none';
-            TimeoutManager.open(); 
+            TimeoutManager.open(true); 
         });
     }
     if (uiElements.btnNextSet) {
@@ -2665,6 +4009,7 @@ function toggleTossQuality(property, value) {
 }
 function updateInputDisplay() {
     UIManager.updateInputForm();
+    UIManager.updateCourtRotation(currentRotation);
 }
 function updateScoreboardUI() {
     UIManager.updateScoreboard();
@@ -2700,6 +4045,32 @@ async function addRallyEntryToDB() {
         UIManager.showFeedback('スパイカーと結果は必須です。');
         return;
     }
+    if (!GameManager.validateAttackRules(currentRallyEntry)) {
+        const player = testPlayerList[currentRallyEntry.spiker_id];
+        const msg = `【警告】\n${player ? player.name : 'この選手'}は現在「後衛」です。\n前衛エリアからの攻撃になっていますが、登録しますか？\n(バックアタックの場合は種類を変更してください)`;
+        if (!confirm(msg)) {
+            return;
+        }
+    }
+    let reasonCode = '';
+    const type = currentRallyEntry.attack_type;
+    const res = currentRallyEntry.result;
+    if (res === 'KILL') {
+            reasonCode = 'S';
+    }
+    else if (res === 'FAULT' || res === 'BLOCKED' || type === 'SERVE_MISS') {
+        if (res === 'BLOCKED') {
+            reasonCode = 'B'; // 被ブロック (Blocked Spike)
+        } else if (['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK','C_QUICK','A_SEMI','B_SEMI','C_SEMI'].includes(type)) {
+            reasonCode = 'MS'; // スパイクミス (ご要望の通り)
+        } else if (type === 'FOUL') { // ドリブルなど
+            reasonCode = 'F';
+        }
+        if (currentRallyEntry.toss_distance === 'miss') {
+            reasonCode = 'F'; // トスミス＝ドリブル等＝反則
+        }
+    }
+    currentRallyEntry.reason = reasonCode;
     if (currentRallyEntry.play_id) {
         try {
             const oldRecord = await db.rallyLog.get(currentRallyEntry.play_id);
@@ -2713,6 +4084,10 @@ async function addRallyEntryToDB() {
         }
         return; // ここで終了
     }
+    const spikeTypes = ['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'];
+    const isEffectiveSpike = spikeTypes.includes(currentRallyEntry.attack_type) 
+                          && currentRallyEntry.result === 'EFFECTIVE';
+    resetCurrentEntry(isEffectiveSpike);
     const pointDelta = GameManager.calcPointDelta(currentRallyEntry);
     let didOurTeamWin = null;
     if (pointDelta === 1) didOurTeamWin = true;
@@ -2735,9 +4110,9 @@ async function addRallyEntryToDB() {
 /**
  * 7. 「取消」または「追加」成功時に、入力ステートをリセットする
  */
-function resetCurrentEntry() {
-    currentRallyEntry = { ...defaultRallyEntry }; 
-    currentRallyEntry.rally_id = currentRallyId; // ★現在のラリーID
+function resetCurrentEntry(nextIsChance = false) {
+    currentRallyEntry = { ...defaultRallyEntry };
+    currentRallyEntry.rally_id = currentRallyId;
     currentRallyEntry.match_id = currentMatchId;
     currentRallyEntry.set_number = currentSetNumber;
     currentRallyEntry.rotation_number = currentRotation;
@@ -2749,17 +4124,19 @@ function resetCurrentEntry() {
     } else {
         currentRallyEntry.setter_id = currentSetterId;
     }
+    if (nextIsChance) {
+        currentRallyEntry.pass_position = 'CHANCE';
+    }
     if (typeof resetAttackTypeStates === 'function') resetAttackTypeStates();
     if (uiElements.btnAdd) {
         uiElements.btnAdd.innerHTML = '追&nbsp;加';
         uiElements.btnAdd.style.backgroundColor = '';
     }
-    updateInputDisplay(); // UIもリセット
+    updateInputDisplay();
 }
 
 
 // --- スワイプロジック (DB保存部分を削除し、ステート更新のみに変更) ---
-
 function setupSwipeListeners(buttons) {
     let timer = null;
     let isLongPress = false;
@@ -3384,6 +4761,14 @@ function openMatchSetupModalForNextSet() {
     if (uiElements.btnSetupCancel) {
         uiElements.btnSetupCancel.style.display = 'none';
     }
+    const toggle = document.getElementById('setup-first-serve');
+    if (toggle) {
+        if (GameManager.state.firstServerOfCurrentSet === 'our') {
+            toggle.checked = false;
+        } else {
+            toggle.checked = true;
+        }
+    }
     tempStarters = {};
     testRoster.forEach(entry => {
         const player = testPlayerList[entry.playerId];
@@ -3397,7 +4782,6 @@ function openMatchSetupModalForNextSet() {
     for (let i = 1; i <= 6; i++) {
         const btn = uiElements.starterButtons[i];
         const starter = tempStarters[i];
-        
         if (starter) {
             const player = allPlayersCache.find(p => p.player_id === starter.playerId);
             if (player) {
@@ -3462,7 +4846,7 @@ async function startMatch() {
     }
     const l1Id = uiElements.setupLibero1.value;
     const l2Id = uiElements.setupLibero2.value;
-    const isOurServe = document.querySelector('input[name="first-serve"]:checked').value === 'our';
+    const isOurServe = document.getElementById('setup-first-serve').checked;
     const today = new Date().toLocaleDateString();
     try {
         // --- A. 既存試合の検索 ---
@@ -3562,6 +4946,7 @@ async function startMatch() {
                 currentSetterId = null;
             }
             GameManager.state.setterId = currentSetterId;
+            UIManager.updateCompetitionName(competition);
             // --- E. 画面更新 ---
             if (uiElements.oppTeamNameDisplay) {
                 uiElements.oppTeamNameDisplay.textContent = opponent;
@@ -3592,7 +4977,7 @@ async function startNextSet() {
     }
     const l1Id = uiElements.setupLibero1.value;
     const l2Id = uiElements.setupLibero2.value;
-    const isOurServe = document.querySelector('input[name="first-serve"]:checked').value === 'our';
+    const isOurServe = document.getElementById('setup-first-serve').checked;
     try {
         await GameManager.proceedToNextSet(); 
         const newSetNum = GameManager.state.setNumber;
@@ -3621,6 +5006,7 @@ async function startNextSet() {
         }
         await db.setRoster.bulkPut(rosterEntries); // bulkPutで上書き保存
         GameManager.state.isOurServing = isOurServe;
+        GameManager.state.firstServerOfCurrentSet = isOurServe ? 'our' : 'opp';
         GameManager.syncGlobals();
         liberoPairs = [];
         testRoster = [];
@@ -3808,7 +5194,7 @@ function determineAttackType(spikerId, tossArea) {
         if (tossArea === 'B') return 'B_SEMI';
         if (tossArea === 'C') return 'C_SEMI';
     }
-    if (rosterEntry.position_in_rotation >= 4 && tossArea === 'BACK') {
+    if (tossArea === 'BACK') {
         return 'BACK_ATTACK';
     }
     if (tossArea === 'L') {
