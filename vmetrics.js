@@ -4038,39 +4038,18 @@ function handleAttackTypeChange() {
  * 6. DBに「追加」する処理 (「追加」ボタンで呼び出し)
  */
 async function addRallyEntryToDB() {
+    // 1. 基本情報のセット
     currentRallyEntry.match_id = currentMatchId;
     currentRallyEntry.set_number = currentSetNumber;
     currentRallyEntry.rotation_number = currentRotation;
+
+    // 2. 入力チェック
     if (!currentRallyEntry.spiker_id || !currentRallyEntry.result) {
         UIManager.showFeedback('スパイカーと結果は必須です。');
         return;
     }
-    if (!GameManager.validateAttackRules(currentRallyEntry)) {
-        const player = testPlayerList[currentRallyEntry.spiker_id];
-        const msg = `【警告】\n${player ? player.name : 'この選手'}は現在「後衛」です。\n前衛エリアからの攻撃になっていますが、登録しますか？\n(バックアタックの場合は種類を変更してください)`;
-        if (!confirm(msg)) {
-            return;
-        }
-    }
-    let reasonCode = '';
-    const type = currentRallyEntry.attack_type;
-    const res = currentRallyEntry.result;
-    if (res === 'KILL') {
-            reasonCode = 'S';
-    }
-    else if (res === 'FAULT' || res === 'BLOCKED' || type === 'SERVE_MISS') {
-        if (res === 'BLOCKED') {
-            reasonCode = 'B'; // 被ブロック (Blocked Spike)
-        } else if (['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK','C_QUICK','A_SEMI','B_SEMI','C_SEMI'].includes(type)) {
-            reasonCode = 'MS'; // スパイクミス (ご要望の通り)
-        } else if (type === 'FOUL') { // ドリブルなど
-            reasonCode = 'F';
-        }
-        if (currentRallyEntry.toss_distance === 'miss') {
-            reasonCode = 'F'; // トスミス＝ドリブル等＝反則
-        }
-    }
-    currentRallyEntry.reason = reasonCode;
+
+    // 3. 編集モードの場合の処理
     if (currentRallyEntry.play_id) {
         try {
             const oldRecord = await db.rallyLog.get(currentRallyEntry.play_id);
@@ -4078,30 +4057,63 @@ async function addRallyEntryToDB() {
             await db.rallyLog.put(currentRallyEntry);
             console.log(`【DB更新成功】Play ID: ${currentRallyEntry.play_id}`);
             UIManager.showFeedback('修正を保存しました。');
-            resetCurrentEntry(); // フォームをリセットして新規モードに戻す
+            resetCurrentEntry();
         } catch (err) {
             console.error('【修正保存失敗】', err);
         }
-        return; // ここで終了
+        return;
     }
-    const spikeTypes = ['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'];
-    const isEffectiveSpike = spikeTypes.includes(currentRallyEntry.attack_type) 
-                          && currentRallyEntry.result === 'EFFECTIVE';
-    resetCurrentEntry(isEffectiveSpike);
+
+    // 4. 得点・失点理由コードの自動判定 (前回実装部分)
+    let reasonCode = '';
+    const type = currentRallyEntry.attack_type;
+    const res = currentRallyEntry.result;
+
+    if (res === 'KILL') {
+        if (type === 'SERVE_ACE') reasonCode = 'SA';
+        else if (type === 'BLOCK') reasonCode = 'B';
+        else if (['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'].includes(type)) reasonCode = 'S';
+        else if (type === 'OPPONENT_MISS') reasonCode = 'OP';
+        else if (type === 'DIRECT' || type === 'TWO_ATTACK') reasonCode = 'S';
+    } else if (res === 'FAULT' || res === 'BLOCKED' || type === 'SERVE_MISS') {
+        if (type === 'SERVE_MISS') reasonCode = 'SV';
+        else if (res === 'BLOCKED') reasonCode = 'BS';
+        else if (['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK'].includes(type)) reasonCode = 'MS';
+        else if (type === 'FOUL') reasonCode = 'F';
+        
+        if (currentRallyEntry.toss_distance === 'miss') reasonCode = 'F';
+    }
+    currentRallyEntry.reason = reasonCode;
+
+    // ★5. 得点変動の判定 (ここが重要です)
     const pointDelta = GameManager.calcPointDelta(currentRallyEntry);
-    let didOurTeamWin = null;
-    if (pointDelta === 1) didOurTeamWin = true;
-    if (pointDelta === -1) didOurTeamWin = false;
+
+    // 6. DB保存と状態更新
     if (uiElements.btnAdd) uiElements.btnAdd.disabled = true;
     try {
         const id = await db.rallyLog.add(currentRallyEntry);
         console.log(`【DB保存成功】Play ID: ${id}`);
-        if (didOurTeamWin !== null) {
-            processPointEnd(didOurTeamWin);
+
+        // ★修正ポイント: 得点が動く場合は processPointEnd を呼ぶ
+        if (pointDelta !== 0) {
+            const isOurPoint = (pointDelta === 1);
+            // processPointEnd 内で addScore, rotate, updateScoreboard, resetCurrentEntry が全て行われます
+            processPointEnd(isOurPoint);
+        } else {
+            // 得点が動かない（ラリー継続）場合
+            
+            // "有効"スパイクなら次はチャンスにする判定
+            const spikeTypes = ['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'];
+            const isEffectiveSpike = spikeTypes.includes(currentRallyEntry.attack_type) 
+                                  && currentRallyEntry.result === 'EFFECTIVE';
+            
+            // リセットのみ行う
+            resetCurrentEntry(isEffectiveSpike);
         }
-        resetCurrentEntry();
+
     } catch (err) {
         console.error('【DB保存失敗】', err, currentRallyEntry);
+        UIManager.showFeedback("保存エラーが発生しました");
     } finally {
         if (uiElements.btnAdd) uiElements.btnAdd.disabled = false;
     }
@@ -5255,4 +5267,5 @@ async function endMatchWithoutSaving() {
         UIManager.showFeedback("データの削除に失敗しましたが、ホームへ戻ります。");
         showMatchEndModal();
     }
+
 }
