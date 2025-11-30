@@ -4038,18 +4038,16 @@ function handleAttackTypeChange() {
  * 6. DBに「追加」する処理 (「追加」ボタンで呼び出し)
  */
 async function addRallyEntryToDB() {
-    // 1. 基本情報のセット
     currentRallyEntry.match_id = currentMatchId;
     currentRallyEntry.set_number = currentSetNumber;
     currentRallyEntry.rotation_number = currentRotation;
 
-    // 2. 入力チェック
     if (!currentRallyEntry.spiker_id || !currentRallyEntry.result) {
         UIManager.showFeedback('スパイカーと結果は必須です。');
         return;
     }
 
-    // 3. 編集モードの場合の処理
+    // --- 修正モードの場合 ---
     if (currentRallyEntry.play_id) {
         try {
             const oldRecord = await db.rallyLog.get(currentRallyEntry.play_id);
@@ -4057,6 +4055,9 @@ async function addRallyEntryToDB() {
             await db.rallyLog.put(currentRallyEntry);
             console.log(`【DB更新成功】Play ID: ${currentRallyEntry.play_id}`);
             UIManager.showFeedback('修正を保存しました。');
+            
+            // ★重要: 修正完了後は必ずIDを消してリセット
+            delete currentRallyEntry.play_id;
             resetCurrentEntry();
         } catch (err) {
             console.error('【修正保存失敗】', err);
@@ -4064,11 +4065,13 @@ async function addRallyEntryToDB() {
         return;
     }
 
-    // 4. 得点・失点理由コードの自動判定 (前回実装部分)
+    // --- 新規追加モード ---
+    const pointDelta = GameManager.calcPointDelta(currentRallyEntry);
+    
+    // 理由コード自動判定
     let reasonCode = '';
     const type = currentRallyEntry.attack_type;
     const res = currentRallyEntry.result;
-
     if (res === 'KILL') {
         if (type === 'SERVE_ACE') reasonCode = 'SA';
         else if (type === 'BLOCK') reasonCode = 'B';
@@ -4079,45 +4082,41 @@ async function addRallyEntryToDB() {
         if (type === 'SERVE_MISS') reasonCode = 'SV';
         else if (res === 'BLOCKED') reasonCode = 'BS';
         else if (['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK'].includes(type)) reasonCode = 'MS';
-        else if (type === 'FOUL') reasonCode = 'F';
-        
-        if (currentRallyEntry.toss_distance === 'miss') reasonCode = 'F';
+        else if (type === 'FOUL' || currentRallyEntry.toss_distance === 'miss') reasonCode = 'F';
     }
     currentRallyEntry.reason = reasonCode;
 
-    // ★5. 得点変動の判定 (ここが重要です)
-    const pointDelta = GameManager.calcPointDelta(currentRallyEntry);
-
-    // 6. DB保存と状態更新
     if (uiElements.btnAdd) uiElements.btnAdd.disabled = true;
+    
     try {
+        // ★DBに追加（ここで currentRallyEntry に play_id が付与される）
         const id = await db.rallyLog.add(currentRallyEntry);
         console.log(`【DB保存成功】Play ID: ${id}`);
 
-        // ★修正ポイント: 得点が動く場合は processPointEnd を呼ぶ
+        // ★★★ 修正ポイント: 追加されたIDを即座に削除して、オブジェクトを「新規」状態に戻す ★★★
+        delete currentRallyEntry.play_id; 
+
+        // 得点変動の有無で分岐
         if (pointDelta !== 0) {
             const isOurPoint = (pointDelta === 1);
-            // processPointEnd 内で addScore, rotate, updateScoreboard, resetCurrentEntry が全て行われます
-            processPointEnd(isOurPoint);
+            processPointEnd(isOurPoint); // ここでリセットと画面更新が行われる
         } else {
-            // 得点が動かない（ラリー継続）場合
-            
-            // "有効"スパイクなら次はチャンスにする判定
+            // 有効スパイクなら次はチャンス
             const spikeTypes = ['SPIKE', 'LEFT', 'RIGHT', 'BACK_ATTACK', 'A_QUICK', 'B_QUICK', 'C_QUICK', 'A_SEMI', 'B_SEMI', 'C_SEMI'];
-            const isEffectiveSpike = spikeTypes.includes(currentRallyEntry.attack_type) 
-                                  && currentRallyEntry.result === 'EFFECTIVE';
-            
-            // リセットのみ行う
+            const isEffectiveSpike = spikeTypes.includes(type) && res === 'EFFECTIVE';
             resetCurrentEntry(isEffectiveSpike);
         }
 
     } catch (err) {
         console.error('【DB保存失敗】', err, currentRallyEntry);
         UIManager.showFeedback("保存エラーが発生しました");
+        // エラー時もIDが残らないように消しておく
+        delete currentRallyEntry.play_id;
     } finally {
         if (uiElements.btnAdd) uiElements.btnAdd.disabled = false;
     }
 }
+
 
 /**
  * 7. 「取消」または「追加」成功時に、入力ステートをリセットする
@@ -5180,6 +5179,7 @@ function processPointEnd(didOurTeamWin) {
     defaultRallyEntry.rotation_number = currentRotation;
     defaultRallyEntry.rally_id = currentRallyId;
     currentRallyEntry.rotation_number = currentRotation;
+    if (defaultRallyEntry.play_id) delete defaultRallyEntry.play_id;
     updateSpikerUIRotation(currentRotation);
     updateScoreboardDisplay();
     updateScoreboardUI();
@@ -5269,4 +5269,5 @@ async function endMatchWithoutSaving() {
     }
 
 }
+
 
